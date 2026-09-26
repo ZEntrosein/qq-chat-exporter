@@ -459,6 +459,8 @@ export interface ScheduledExport {
     skipDownloadResourceTypes?: Array<'image' | 'video' | 'audio' | 'file'>
     /** Issue #311: 自包含 HTML（资源 base64 内联）。 */
     embedResourcesAsDataUri?: boolean
+    /** 定时 HTML 导出为独立 ZIP，不复用公共 resources 目录。 */
+    exportAsZip?: boolean
   }
   outputDir?: string
   enabled: boolean
@@ -507,6 +509,8 @@ export interface CreateScheduledExportForm {
   skipDownloadResourceTypes?: Array<'image' | 'video' | 'audio' | 'file'>
   /** Issue #646: 定时 HTML 导出把图片等资源 base64 内联，生成自包含单文件。 */
   embedResourcesAsDataUri?: boolean
+  /** 定时 HTML 导出为独立 ZIP，不复用公共 resources 目录。 */
+  exportAsZip?: boolean
 }
 
 export interface ScheduledExportsResponse {

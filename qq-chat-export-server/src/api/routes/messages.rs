@@ -47,6 +47,7 @@ const ROAMING_RETRY_BACKOFF_BASE_MS: u64 = 120;
 const ROAMING_MAX_RETRIES: usize = 3;
 const ROAMING_CANCEL_POLL_MS: u64 = 25;
 use crate::clean_message_spool::{CleanMessageSpool, SpooledCleanMessageSource};
+use crate::export_archive::create_zip_with_resources;
 use crate::export_debug::ExportDebugSession;
 use crate::fetcher::{
     acquire_history_query_permit, chat_type_prefix, classify_chat_type_binary,
@@ -2096,45 +2097,6 @@ fn to_value_resource_map(
             (msg_id.clone(), values)
         })
         .collect()
-}
-
-/// ZIP 打包（阻塞线程执行）：HTML 文件 + resources 相对路径列表。
-/// issue #634：逐文件流式复制，不把单个文件整体读入内存。
-async fn create_zip_with_resources(
-    base_dir: PathBuf,
-    main_file: PathBuf,
-    resource_rel_paths: Vec<String>,
-    zip_path: PathBuf,
-) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let file = std::fs::File::create(&zip_path).map_err(|e| e.to_string())?;
-        let mut zip = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
-        let main_name = main_file
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .ok_or_else(|| "无效的主文件名".to_string())?;
-        zip.start_file(&main_name, options)
-            .map_err(|e| e.to_string())?;
-        let mut main = std::fs::File::open(&main_file).map_err(|e| e.to_string())?;
-        std::io::copy(&mut main, &mut zip).map_err(|e| e.to_string())?;
-        for rel in resource_rel_paths {
-            let src = base_dir.join(&rel);
-            let Ok(mut src) = std::fs::File::open(&src) else {
-                continue;
-            };
-            let entry_name = rel.replace('\\', "/");
-            if zip.start_file(&entry_name, options).is_err() {
-                continue;
-            }
-            let _ = std::io::copy(&mut src, &mut zip);
-        }
-        zip.finish().map_err(|e| e.to_string())?;
-        Ok(())
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 /// ZIP 打包整个目录（阻塞线程执行）。

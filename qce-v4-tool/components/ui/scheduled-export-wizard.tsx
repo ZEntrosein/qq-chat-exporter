@@ -81,6 +81,8 @@ export function ScheduledExportWizard({
     debugExport: false,
     // Issue #646：定时 HTML 导出把资源内联为 base64，生成自包含单文件。
     embedResourcesAsDataUri: false,
+    // 定时 HTML 导出使用独立临时资源目录，并只保留最终 ZIP。
+    exportAsZip: false,
     // Issue #344：定时导出也支持按资源类型逐项跳过下载。
     skipDownloadResourceTypes: undefined as SkipDownloadResourceType[] | undefined,
   })
@@ -131,6 +133,7 @@ export function ScheduledExportWizard({
         preferGroupMemberName: prefilledData.preferGroupMemberName !== undefined ? prefilledData.preferGroupMemberName : true,
         debugExport: prefilledData.debugExport ?? false,
         embedResourcesAsDataUri: prefilledData.embedResourcesAsDataUri ?? false,
+        exportAsZip: prefilledData.exportAsZip ?? false,
         skipDownloadResourceTypes: Array.isArray(prefilledData.skipDownloadResourceTypes) && prefilledData.skipDownloadResourceTypes.length > 0
           ? (prefilledData.skipDownloadResourceTypes as SkipDownloadResourceType[])
           : undefined,
@@ -171,6 +174,7 @@ export function ScheduledExportWizard({
         preferGroupMemberName: true,
         debugExport: false,
         embedResourcesAsDataUri: false,
+        exportAsZip: false,
         skipDownloadResourceTypes: undefined,
       })
       setSelectedTargets([])
@@ -232,8 +236,9 @@ export function ScheduledExportWizard({
         filterPureImageMessages: baseForm.filterPureImageMessages,
         preferGroupMemberName: baseForm.preferGroupMemberName,
         debugExport: baseForm.debugExport,
+        exportAsZip: baseForm.format === 'HTML' && baseForm.exportAsZip,
         // Issue #646：仅 HTML 支持自包含内联，其他格式忽略该开关。
-        embedResourcesAsDataUri: baseForm.format === 'HTML' && baseForm.embedResourcesAsDataUri,
+        embedResourcesAsDataUri: baseForm.format === 'HTML' && !baseForm.exportAsZip && baseForm.embedResourcesAsDataUri,
         ...(!baseForm.filterPureImageMessages && baseForm.skipDownloadResourceTypes && baseForm.skipDownloadResourceTypes.length > 0 && {
           skipDownloadResourceTypes: baseForm.skipDownloadResourceTypes,
         }),
@@ -910,10 +915,18 @@ export function ScheduledExportWizard({
                     {
                       id: "embedResourcesAsDataUri",
                       checked: baseForm.embedResourcesAsDataUri,
-                      set: (v: boolean) => setBaseForm(p => ({ ...p, embedResourcesAsDataUri: v })),
+                      set: (v: boolean) => setBaseForm(p => ({ ...p, embedResourcesAsDataUri: v, exportAsZip: v ? false : p.exportAsZip })),
                       title: "自包含 HTML（内联图片等资源）",
                       desc: "把已下载的图片、语音等资源以 base64 写进 HTML，单个文件即可离线查看，代价是文件体积明显变大。",
-                      visible: baseForm.format === 'HTML' && !baseForm.filterPureImageMessages,
+                      visible: baseForm.format === 'HTML' && !baseForm.filterPureImageMessages && !baseForm.exportAsZip,
+                    },
+                    {
+                      id: "exportAsZip",
+                      checked: baseForm.exportAsZip,
+                      set: (v: boolean) => setBaseForm(p => ({ ...p, exportAsZip: v, embedResourcesAsDataUri: v ? false : p.embedResourcesAsDataUri })),
+                      title: "导出为 ZIP 压缩包",
+                      desc: "每次任务将 HTML 和该次实际引用的资源打成独立 ZIP；完成后只保留 ZIP，不写入公共 resources 目录。",
+                      visible: baseForm.format === 'HTML' && !baseForm.embedResourcesAsDataUri,
                     },
                     {
                       id: "preferGroupMemberName",

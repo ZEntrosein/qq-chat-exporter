@@ -14,6 +14,7 @@ use qce_exporter::{ChatInfo, CleanMessage, DownloadedResourceIndex, ExportOption
 use qce_server::api::helpers::{backfill_self_sender_names, chat_avatar_url, PeerUinResolver};
 use qce_server::api::path_security::resolve_for_creation_within;
 use qce_server::clean_message_spool::{CleanMessageSpool, SpooledCleanMessageSource};
+use qce_server::export_archive::create_zip_with_resources;
 use qce_server::export_debug::ExportDebugSession;
 use qce_server::fetcher::{
     classify_chat_type_binary, BatchFetchConfig, BatchMessageFetcher, MessageFilter, Peer,
@@ -88,6 +89,8 @@ impl ScheduledExportExecutor for ApiScheduledExportExecutor {
             .unwrap_or("HTML")
             .to_uppercase();
         let options = task.get("options").cloned().unwrap_or(Value::Null);
+        let export_as_zip =
+            format == "HTML" && options.get("exportAsZip").and_then(Value::as_bool) == Some(true);
         // Issue #644：任务自带的输出目录可以指向默认导出根之外的位置（例如另一个盘），
         // 由 `PathManager` 统一做安全校验后加入允许的根集合。
         let output_dir = resolve_scheduled_output_dir(
@@ -284,15 +287,36 @@ impl ScheduledExportExecutor for ApiScheduledExportExecutor {
         } else {
             peer_uin.as_deref().unwrap_or(&peer_uid)
         };
+        let output_extension = if export_as_zip {
+            "zip".to_string()
+        } else {
+            format.to_lowercase()
+        };
         let base_file_name = scheduled_export_file_name(
             chat_type_name,
             &session_name,
             peer_identity,
             &timestamp.to_string(),
-            &format.to_lowercase(),
+            &output_extension,
         );
         let (file_name, _reservation) = reserve_scheduled_file_name(&output_dir, &base_file_name);
-        let file_path = output_dir.join(&file_name);
+        let final_file_path = output_dir.join(&file_name);
+        let temporary_export_dir = export_as_zip.then(|| {
+            output_dir.join(format!(
+                ".qce-scheduled-export-{}",
+                uuid::Uuid::new_v4().simple()
+            ))
+        });
+        let export_file_path = temporary_export_dir.as_ref().map_or_else(
+            || final_file_path.clone(),
+            |temp_dir| {
+                let html_file_name = file_name.strip_suffix(".zip").map_or_else(
+                    || format!("{file_name}.html"),
+                    |stem| format!("{stem}.html"),
+                );
+                temp_dir.join(html_file_name)
+            },
+        );
 
         // 阶段 4：两遍顺序扫描做全局后处理（reply 预览索引 + 对端 QQ 号），再导出。
         let self_info = self.napcat.self_info().await.unwrap_or(Value::Null);
@@ -379,7 +403,7 @@ impl ScheduledExportExecutor for ApiScheduledExportExecutor {
             .and_then(Value::as_bool)
             .unwrap_or(true);
         let export_options = ExportOptions {
-            output_path: file_path.clone(),
+            output_path: export_file_path.clone(),
             include_resource_links,
             include_system_messages,
             filter_pure_image_messages: options
@@ -400,15 +424,21 @@ impl ScheduledExportExecutor for ApiScheduledExportExecutor {
 
         match format.as_str() {
             "HTML" => {
+                if let Some(temp_dir) = &temporary_export_dir {
+                    tokio::fs::create_dir_all(temp_dir)
+                        .await
+                        .map_err(|e| format!("创建定时 ZIP 临时目录失败: {e}"))?;
+                }
                 let mut exporter = ModernHtmlExporter::new(HtmlExportOptions {
-                    output_path: file_path.clone(),
+                    output_path: export_file_path.clone(),
                     include_resource_links,
                     include_system_messages,
                     // Issue #311：自包含 HTML（资源以 base64 内联）。
-                    embed_resources_as_data_uri: options
-                        .get("embedResourcesAsDataUri")
-                        .and_then(Value::as_bool)
-                        == Some(true),
+                    embed_resources_as_data_uri: !export_as_zip
+                        && options
+                            .get("embedResourcesAsDataUri")
+                            .and_then(Value::as_bool)
+                            == Some(true),
                     max_embed_file_size_bytes: loose_i64(options.get("maxEmbedFileSizeBytes"))
                         .and_then(|v| u64::try_from(v).ok())
                         .unwrap_or(50 * 1024 * 1024),
@@ -422,10 +452,35 @@ impl ScheduledExportExecutor for ApiScheduledExportExecutor {
                     resource_dir_name: None,
                     exporter_version: Some(qce_server::version::VERSION.get().to_string()),
                 });
-                exporter
+                let copied_resource_paths = match exporter
                     .export_single_inline_source(&mut source, &chat_info)
                     .await
-                    .map_err(|e| e.to_string())?;
+                {
+                    Ok(paths) => paths,
+                    Err(error) => {
+                        if let Some(temp_dir) = &temporary_export_dir {
+                            let _ = tokio::fs::remove_dir_all(temp_dir).await;
+                        }
+                        return Err(error.to_string());
+                    }
+                };
+                if let Some(temp_dir) = &temporary_export_dir {
+                    if let Err(error) = create_zip_with_resources(
+                        temp_dir.clone(),
+                        export_file_path.clone(),
+                        copied_resource_paths,
+                        final_file_path.clone(),
+                    )
+                    .await
+                    {
+                        let _ = tokio::fs::remove_file(&final_file_path).await;
+                        let _ = tokio::fs::remove_dir_all(temp_dir).await;
+                        return Err(format!("创建定时导出 ZIP 失败: {error}"));
+                    }
+                    if let Err(error) = tokio::fs::remove_dir_all(temp_dir).await {
+                        tracing::warn!("[ScheduledExport] ZIP 已创建，但清理临时目录失败: {error}");
+                    }
+                }
             }
             "JSON" => {
                 let exporter = JsonExporter::new(export_options, JsonFormatOptions::default());
@@ -446,7 +501,7 @@ impl ScheduledExportExecutor for ApiScheduledExportExecutor {
         drop(source);
         drop(clean_spool);
 
-        let file_size = tokio::fs::metadata(&file_path)
+        let file_size = tokio::fs::metadata(&final_file_path)
             .await
             .ok()
             .and_then(|meta| i64::try_from(meta.len()).ok());
@@ -468,7 +523,7 @@ impl ScheduledExportExecutor for ApiScheduledExportExecutor {
 
         Ok(ExecutionOutcome {
             message_count,
-            file_path: Some(file_path.to_string_lossy().into_owned()),
+            file_path: Some(final_file_path.to_string_lossy().into_owned()),
             file_size,
             resource_summary,
             note: None,

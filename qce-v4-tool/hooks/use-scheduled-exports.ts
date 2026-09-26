@@ -32,6 +32,8 @@ export interface ScheduledExportConfig {
         skipDownloadResourceTypes?: Array<'image' | 'video' | 'audio' | 'file'>;
         /** Issue #646: 定时 HTML 导出把资源 base64 内联，生成自包含单文件。 */
         embedResourcesAsDataUri?: boolean;
+        /** 定时 HTML 导出为独立 ZIP，不复用公共 resources 目录。 */
+        exportAsZip?: boolean;
     };
     outputDir?: string;
     enabled: boolean;
@@ -64,6 +66,7 @@ export function scheduledExportFormToConfig(formData: CreateScheduledExportForm)
             preferGroupMemberName: formData.preferGroupMemberName ?? true,
             debugExport: formData.debugExport ?? false,
             embedResourcesAsDataUri: formData.embedResourcesAsDataUri ?? false,
+            exportAsZip: formData.exportAsZip ?? false,
             ...(Array.isArray(formData.skipDownloadResourceTypes) && formData.skipDownloadResourceTypes.length > 0 && {
                 skipDownloadResourceTypes: formData.skipDownloadResourceTypes,
             }),
@@ -95,6 +98,7 @@ export function scheduledExportConfigToForm(task: ScheduledExportConfig): Create
         debugExport: task.options.debugExport ?? false,
         skipDownloadResourceTypes: task.options.skipDownloadResourceTypes,
         embedResourcesAsDataUri: task.options.embedResourcesAsDataUri ?? false,
+        exportAsZip: task.options.exportAsZip ?? false,
     };
 }
 

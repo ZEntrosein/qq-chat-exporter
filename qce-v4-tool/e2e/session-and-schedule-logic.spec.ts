@@ -5,6 +5,7 @@
  * sessions must not leak into the friend collection.
  * Issue #646: scheduled HTML exports must keep the self-contained option when a
  * task is created and when it is loaded back into the wizard form.
+ * Scheduled ZIP exports must preserve their isolated-archive option as well.
  */
 
 import { test, expect } from '@playwright/test';
@@ -65,6 +66,7 @@ test.describe('scheduled self-contained HTML (issue #646)', () => {
         timeRangeType: 'yesterday',
         enabled: true,
         embedResourcesAsDataUri: true,
+        exportAsZip: false,
     };
 
     test('form option is persisted into the task options and read back', () => {
@@ -78,5 +80,22 @@ test.describe('scheduled self-contained HTML (issue #646)', () => {
     test('option defaults to disabled when the form does not set it', () => {
         const config = scheduledExportFormToConfig({ ...baseForm, embedResourcesAsDataUri: undefined });
         expect(config.options.embedResourcesAsDataUri).toBe(false);
+    });
+
+    test('ZIP option is persisted into the task options and read back', () => {
+        const config = scheduledExportFormToConfig({
+            ...baseForm,
+            embedResourcesAsDataUri: false,
+            exportAsZip: true,
+        });
+        expect(config.options.exportAsZip).toBe(true);
+
+        const form = scheduledExportConfigToForm(config);
+        expect(form.exportAsZip).toBe(true);
+    });
+
+    test('ZIP option defaults to disabled when the form does not set it', () => {
+        const config = scheduledExportFormToConfig({ ...baseForm, exportAsZip: undefined });
+        expect(config.options.exportAsZip).toBe(false);
     });
 });
