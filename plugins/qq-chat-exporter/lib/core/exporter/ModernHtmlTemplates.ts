@@ -955,6 +955,24 @@ export const MODERN_CSS = `
             height: 20px;
             margin: 0 2px;
         }
+        .reply-content-video {
+            display: block;
+            width: min(240px, 100%);
+            max-height: 160px;
+            margin-top: 6px;
+            border-radius: 6px;
+            background: #000;
+        }
+        .reply-content-audio {
+            display: block;
+            width: min(260px, 100%);
+            height: 34px;
+            margin-top: 6px;
+        }
+        a.reply-content-attachment {
+            color: inherit;
+            text-decoration: underline;
+        }
         
         .message.self .reply-content {
             background: rgba(0, 0, 0, 0.08);

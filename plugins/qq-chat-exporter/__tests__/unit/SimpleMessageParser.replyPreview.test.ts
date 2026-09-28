@@ -240,6 +240,162 @@ test('parseMessagesStream: 范围外引用使用 record 媒体，但不生成无
     assert.equal(replyData.previewElements[0].localPath, `images/${process.platform === 'win32' ? 'node.exe' : 'node'}`);
 });
 
+test('hydrateReplyRecords: 按 replayMsgSeq 回溯空回复的原始图片消息', async () => {
+    const previousBridge = (globalThis as any).__NAPCAT_BRIDGE__;
+    const calls: any[] = [];
+    (globalThis as any).__NAPCAT_BRIDGE__ = {
+        core: {
+            apis: {
+                MsgApi: {
+                    async getMsgsBySeqAndCount(peer: any, seq: string, count: number, forward: boolean, backward: boolean) {
+                        calls.push({ peer, seq, count, forward, backward });
+                        return {
+                            msgList: [rawMessage({
+                                msgId: 'native-source-id',
+                                msgSeq: '5238700',
+                                clientSeq: '5238700',
+                                peerUid: '',
+                                elements: [{
+                                    elementId: 'native-image-element',
+                                    picElement: {
+                                        md5HexStr: 'native-image-md5',
+                                        fileName: 'quoted-native.jpg',
+                                    },
+                                }],
+                            })],
+                        };
+                    },
+                },
+            },
+        },
+    };
+
+    try {
+        const parser = new SimpleMessageParser({ html: 'none' });
+        const reply = rawMessage({
+            msgId: 'empty-reply-id',
+            msgSeq: '5238800',
+            peerUid: 'real-group',
+            records: [],
+            elements: [{
+                replyElement: {
+                    replayMsgId: '0',
+                    replayMsgSeq: '5238700',
+                    sourceMsgIdInRecords: 'snapshot-source-id',
+                    senderUin: '10002',
+                },
+            }],
+        });
+
+        const hydrated = await parser.hydrateReplyRecords([reply]);
+        assert.equal(hydrated, 1);
+        assert.equal(calls.length, 1);
+        assert.deepEqual(calls[0], {
+            peer: { chatType: 2, peerUid: 'real-group', guildId: '' },
+            seq: '5238700',
+            count: 1,
+            forward: true,
+            backward: true,
+        });
+        assert.equal(reply.records.length, 1);
+        assert.equal(reply.records[0].msgId, 'native-source-id');
+        assert.equal(reply.records[0].elements[0].picElement.md5HexStr, 'native-image-md5');
+        assert.equal((reply.records[0] as any).__qceReplyRecord, true);
+        assert.equal((reply.records[0] as any).__qceResourceKey, 'empty-reply-id/reply-snapshot-source-id');
+        assert.equal((reply.records[0] as any).__qceForwardPeer.peerUid, 'real-group');
+
+        const [parsed] = await parser.parseMessages([reply]);
+        const replyData = parsed.content.elements.find(element => element.type === 'reply')!.data;
+        assert.equal(replyData.content, '[图片]');
+        assert.equal(replyData.previewElements[0].md5, 'native-image-md5');
+        assert.equal(replyData.previewResourceMessageId, 'empty-reply-id/reply-snapshot-source-id');
+        assert.equal(replyData.sourceAvailable, false);
+    } finally {
+        if (previousBridge === undefined) delete (globalThis as any).__NAPCAT_BRIDGE__;
+        else (globalThis as any).__NAPCAT_BRIDGE__ = previousBridge;
+    }
+});
+
+test('hydrateReplyRecords: 原生查询不可用时从 sourceMsgTextElems 还原图片和视频', async () => {
+    const previousBridge = (globalThis as any).__NAPCAT_BRIDGE__;
+    (globalThis as any).__NAPCAT_BRIDGE__ = { core: { apis: {} } };
+
+    try {
+        const parser = new SimpleMessageParser({ html: 'none' });
+        const reply = rawMessage({
+            msgId: 'snapshot-reply-id',
+            records: [{
+                ...rawMessage({ msgId: 'snapshot-id', msgSeq: '7000' }),
+                elements: [{ textElement: { content: '[图片]' } }],
+            }],
+            elements: [{
+                replyElement: {
+                    replayMsgSeq: '7000',
+                    sourceMsgIdInRecords: 'snapshot-id',
+                    sourceMsgTextElems: [
+                        { picElem: { md5HexStr: 'snapshot-pic-md5', fileName: 'snapshot.jpg' } },
+                        { videoElem: { fileName: 'snapshot.mp4', fileUuid: 'video-uuid' } },
+                    ],
+                },
+            }],
+        });
+
+        const hydrated = await parser.hydrateReplyRecords([reply]);
+        assert.equal(hydrated, 1);
+        assert.equal(reply.records.length, 1, '原占位快照应被替换，不应重复追加');
+        assert.equal(reply.records[0].elements[0].picElement.md5HexStr, 'snapshot-pic-md5');
+        assert.equal(reply.records[0].elements[1].videoElement.fileUuid, 'video-uuid');
+
+        const [parsed] = await parser.parseMessages([reply]);
+        const replyData = parsed.content.elements.find(element => element.type === 'reply')!.data;
+        assert.deepEqual(replyData.previewElements.map((element: any) => element.type), ['image', 'video']);
+        assert.equal(replyData.content, '[图片][视频:snapshot.mp4]');
+    } finally {
+        if (previousBridge === undefined) delete (globalThis as any).__NAPCAT_BRIDGE__;
+        else (globalThis as any).__NAPCAT_BRIDGE__ = previousBridge;
+    }
+});
+
+test('hydrateReplyRecords: 普通纯文字回复不额外调用原生历史接口', async () => {
+    const previousBridge = (globalThis as any).__NAPCAT_BRIDGE__;
+    let queryCount = 0;
+    (globalThis as any).__NAPCAT_BRIDGE__ = {
+        core: {
+            apis: {
+                MsgApi: {
+                    async getMsgsBySeqAndCount() {
+                        queryCount++;
+                        return { msgList: [] };
+                    },
+                },
+            },
+        },
+    };
+
+    try {
+        const parser = new SimpleMessageParser({ html: 'none' });
+        const reply = rawMessage({
+            msgId: 'plain-text-reply',
+            records: [],
+            elements: [{
+                replyElement: {
+                    replayMsgSeq: '8000',
+                    sourceMsgIdInRecords: 'plain-text-source',
+                    sourceMsgText: '这是一条普通文字消息',
+                },
+            }],
+        });
+
+        const hydrated = await parser.hydrateReplyRecords([reply]);
+        assert.equal(hydrated, 0);
+        assert.equal(queryCount, 0);
+        assert.equal(reply.records.length, 0);
+    } finally {
+        if (previousBridge === undefined) delete (globalThis as any).__NAPCAT_BRIDGE__;
+        else (globalThis as any).__NAPCAT_BRIDGE__ = previousBridge;
+    }
+});
+
 test('backfillReplyPreviewLocalPathsFromResourceMap: 下载失败的计划路径不写入 HTML 数据', () => {
     const parser = new SimpleMessageParser({ html: 'none' });
     const reply = makeReplyMessage('101', '100', [
@@ -258,6 +414,24 @@ test('backfillReplyPreviewLocalPathsFromResourceMap: 下载失败的计划路径
     const preview = (reply.content.elements[0]!.data as any).previewElements[0];
     assert.equal(preview.localPath, undefined);
     assert.equal(preview.originUrl, 'http://q.qq/fallback');
+});
+
+test('backfillReplyPreviewLocalPathsFromResourceMap: 回填引用视频的离线路径', () => {
+    const parser = new SimpleMessageParser({ html: 'none' });
+    const reply = makeReplyMessage('101', '', [
+        { type: 'video', text: '[视频:quoted.mp4]', fileName: 'quoted.mp4' },
+    ]);
+    (reply.content.elements[0]!.data as any).previewResourceMessageId = 'reply-resource-key';
+    parser.backfillReplyPreviewLocalPathsFromResourceMap(reply, new Map([
+        ['reply-resource-key', [{
+            type: 'video',
+            localPath: process.execPath,
+            accessible: true,
+        }]],
+    ]));
+
+    const preview = (reply.content.elements[0]!.data as any).previewElements[0];
+    assert.equal(preview.localPath, `videos/${process.platform === 'win32' ? 'node.exe' : 'node'}`);
 });
 
 test('parseMessagesStream: 合并转发子消息媒体从 resourceMap 回填离线路径', async () => {

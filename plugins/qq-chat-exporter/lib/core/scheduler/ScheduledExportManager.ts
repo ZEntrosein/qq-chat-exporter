@@ -834,6 +834,10 @@ export class ScheduledExportManager {
                 if (hydratedForwardCount > 0) {
                     console.info(`[ScheduledExport] 已预取 ${hydratedForwardCount} 条合并转发详情`);
                 }
+                const hydratedReplyCount = await forwardHydrator.hydrateReplyRecords(allMessages);
+                if (hydratedReplyCount > 0) {
+                    console.info(`[ScheduledExport] 已回溯 ${hydratedReplyCount} 条回复引用的原始消息`);
+                }
             }
             await this.waitForExecutionCheckpoint(task.id);
 

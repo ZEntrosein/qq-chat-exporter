@@ -4044,6 +4044,10 @@ export class QQChatExporterApiServer {
                     if (hydratedForwardCount > 0) {
                         console.info(`[ApiServer] 已预取 ${hydratedForwardCount} 条合并转发详情`);
                     }
+                    const hydratedReplyCount = await forwardHydrator.hydrateReplyRecords(filteredMessages);
+                    if (hydratedReplyCount > 0) {
+                        console.info(`[ApiServer] 已回溯 ${hydratedReplyCount} 条回复引用的原始消息`);
+                    }
                 }
 
                 // 下载和处理资源（使用过滤后的消息列表）
@@ -4520,6 +4524,7 @@ export class QQChatExporterApiServer {
             if (options.processResources && filteredBatch.length > 0 && options.resourceHandler) {
                 try {
                     await parser.hydrateForwardRecords(filteredBatch);
+                    await parser.hydrateReplyRecords(filteredBatch);
                     batchResourceMap = await options.resourceHandler.processMessageResources(filteredBatch);
                 } catch (error) {
                     console.warn(`[StreamingExport] 批次 ${batchCount} 资源处理失败:`, error);

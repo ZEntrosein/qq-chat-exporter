@@ -155,12 +155,31 @@ test('renderReplyPreviewElement: video 没 fileName 时退到 text 占位符', (
     assert.match(html, /🎬 \[视频\]/);
 });
 
+test('renderReplyPreviewElement: video 有本地路径时输出可播放的 video', () => {
+    const html = renderReplyPreviewElement(
+        { type: 'video', localPath: 'videos/quoted.mp4', fileName: 'quoted.mp4' },
+        baseCtx,
+    );
+    assert.match(html, /<video\s+src="resources\/videos\/quoted\.mp4"/);
+    assert.match(html, /controls/);
+    assert.match(html, /preload="metadata"/);
+});
+
 test('renderReplyPreviewElement: audio 用 🎵 icon + text 占位符', () => {
     const html = renderReplyPreviewElement(
         { type: 'audio', text: '[语音]' },
         baseCtx,
     );
     assert.match(html, /<span class="reply-content-attachment">🎵 \[语音\]<\/span>/);
+});
+
+test('renderReplyPreviewElement: audio 有本地路径时输出播放器', () => {
+    const html = renderReplyPreviewElement(
+        { type: 'audio', localPath: 'audios/quoted.amr', text: '[语音]' },
+        baseCtx,
+    );
+    assert.match(html, /<audio\s+src="resources\/audios\/quoted\.amr"/);
+    assert.match(html, /controls/);
 });
 
 test('renderReplyPreviewElement: file 用 📎 icon + 文件名', () => {

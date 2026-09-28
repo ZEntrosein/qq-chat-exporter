@@ -307,6 +307,8 @@ const DEFAULT_SIMPLE_OPTIONS: Required<Omit<SimpleParserOptions, 'onProgress' | 
 export class SimpleMessageParser {
   /** 嵌套合并转发递归深度上限。三层基本足够，再深就不展开避免栈/性能爆炸。 */
   private static readonly MAX_FORWARD_DEPTH = 3;
+  /** 回复链可以再引用另一条回复，限制回溯深度避免异常数据形成环。 */
+  private static readonly MAX_REPLY_DEPTH = 6;
 
   private readonly options: Required<Omit<SimpleParserOptions, 'onProgress' | 'senderTitleResolver'>> & {
     senderTitleResolver?: SenderTitleResolver;
@@ -397,6 +399,292 @@ export class SimpleMessageParser {
       await walk(message, 0);
     }
     return hydratedCount;
+  }
+
+  /**
+   * 在资源扫描之前补齐 reply 引用的原始消息。
+   *
+   * QQNT 有一类“空回复”：顶层消息只有 replyElement，图片/视频本体只存在
+   * 被引用的原消息中。它不在当前导出时间范围内时，单靠 message.records
+   * 和 sourceMsgTextElems 往往只能得到「[图片]」占位文字。这里参照 OhMyMeme 已验证
+   * 的实现，按 replayMsgSeq 调用 NapCat MsgApi 取回原始 RawMessage，再将其
+   * 作为仅供引用预览/资源扫描使用的 record 挂回父消息。
+   *
+   * 原生接口不可用或查询失败时，把 sourceMsgTextElems 中的 picElem / videoElem /
+   * pttElem / fileElem 还原为正常 MessageElement，仍能交给现有 ResourceHandler 处理。
+   */
+  async hydrateReplyRecords(messages: RawMessage[]): Promise<number> {
+    if (!Array.isArray(messages) || messages.length === 0) return 0;
+
+    const topById = new Map<string, RawMessage>();
+    const topBySeq = new Map<string, RawMessage>();
+    for (const message of messages) {
+      if (message?.msgId != null) topById.set(String(message.msgId), message);
+      if (message?.msgSeq != null) topBySeq.set(String(message.msgSeq), message);
+      if (message?.clientSeq != null) topBySeq.set(String(message.clientSeq), message);
+    }
+
+    const visited = new WeakSet<object>();
+    const fetchCache = new Map<string, Promise<RawMessage | null>>();
+    let hydratedCount = 0;
+
+    const walk = async (message: RawMessage, depth: number): Promise<void> => {
+      if (!message || depth > SimpleMessageParser.MAX_REPLY_DEPTH) return;
+      if (typeof message === 'object') {
+        if (visited.has(message as object)) return;
+        visited.add(message as object);
+      }
+
+      const replyElements = (message.elements || [])
+        .map((element: MessageElement) => element?.replyElement)
+        .filter(Boolean);
+      let records = Array.isArray((message as any).records)
+        ? ((message as any).records as RawMessage[]).filter(Boolean)
+        : [];
+
+      for (let replyIndex = 0; replyIndex < replyElements.length; replyIndex++) {
+        const replyElement = replyElements[replyIndex];
+        const sourceId = this.replySourceMessageId(replyElement);
+        const sequence = this.replySourceSequence(replyElement);
+        const topLevel = (sourceId && topById.get(sourceId)) || (sequence && topBySeq.get(sequence));
+        if (topLevel && this.hasUsefulReplySource(topLevel)) continue;
+
+        const existingIndex = records.findIndex(record => this.matchesReplySource(record, replyElement));
+        const existing = existingIndex >= 0 ? records[existingIndex] : undefined;
+        const snapshot = this.rawMessageFromReplySnapshot(message, replyElement);
+        const snapshotHasMedia = snapshot ? this.hasMediaElements(snapshot) : false;
+
+        // 普通文字回复的 record 本来就足够，不额外打 NapCat 接口。
+        // 空 record、只有「[图片]」之类占位符，或快照明确带媒体时才回查。
+        const needsRecovery = !existing
+          || !this.hasUsefulReplySource(existing)
+          || (snapshotHasMedia && !this.hasMediaElements(existing));
+        if (!needsRecovery) continue;
+
+        let recovered: RawMessage | null = null;
+        const inlineText = String(
+          replyElement?.sourceMsgText
+          ?? replyElement?.referencedMsg?.msgBody
+          ?? ''
+        ).trim();
+        const inlineTextNeedsMedia = /\[(?:图片|视频|语音|文件)\]/.test(inlineText);
+        const shouldQueryNative = Boolean(sequence && (
+          snapshotHasMedia
+          || (existing && !this.hasUsefulReplySource(existing))
+          || (!existing && !snapshot && (!inlineText || inlineTextNeedsMedia))
+        ));
+        if (shouldQueryNative) {
+          const peer = this.getForwardFetchContext(message).peer;
+          const cacheKey = `${peer.chatType}:${peer.peerUid}:${peer.guildId}:${sequence}`;
+          let pending = fetchCache.get(cacheKey);
+          if (!pending) {
+            pending = this.fetchReplyRawMessageBySequence(message, sequence);
+            fetchCache.set(cacheKey, pending);
+          }
+          const fetched = await pending;
+          // 同一条原消息可能被多条回复引用。每个父消息都需要独立的
+          // __qceResourceKey，不能共享同一个对象后相互覆盖内部字段。
+          recovered = fetched ? { ...(fetched as any) } as RawMessage : null;
+        }
+
+        // 原生返回偶尔只有占位文本，而 reply 快照反而带 picElem/videoElem；
+        // 这种情况快照更有价值。
+        if (!recovered || (snapshotHasMedia && !this.hasMediaElements(recovered))) {
+          recovered = snapshot;
+        }
+        if (!recovered || !this.hasUsefulReplySource(recovered)) continue;
+
+        this.attachReplyFetchContext(recovered, message, replyElement, replyIndex);
+        if (existingIndex >= 0) records[existingIndex] = recovered;
+        else records.push(recovered);
+        (message as any).records = records;
+        hydratedCount++;
+      }
+
+      // 用最新 records 继续走，支持“回复引用的消息本身又是回复”。
+      records = Array.isArray((message as any).records)
+        ? ((message as any).records as RawMessage[]).filter(Boolean)
+        : [];
+      for (const record of records) await walk(record, depth + 1);
+    };
+
+    for (const message of messages) await walk(message, 0);
+    return hydratedCount;
+  }
+
+  private replySourceMessageId(replyElement: any): string {
+    return String(replyElement?.sourceMsgIdInRecords ?? replyElement?.replayMsgId ?? '').trim();
+  }
+
+  private replySourceSequence(replyElement: any): string {
+    return String(replyElement?.replayMsgSeq ?? replyElement?.replyMsgClientSeq ?? '').trim();
+  }
+
+  private matchesReplySource(record: RawMessage, replyElement: any): boolean {
+    if (!record) return false;
+    const sourceId = this.replySourceMessageId(replyElement);
+    const sequence = this.replySourceSequence(replyElement);
+    if (sourceId && String(record.msgId || '') === sourceId) return true;
+    return Boolean(sequence && [record.msgSeq, record.clientSeq, (record as any).realSeq]
+      .some(value => value != null && String(value) === sequence));
+  }
+
+  private hasMediaElements(message: RawMessage): boolean {
+    return (message?.elements || []).some((element: MessageElement) => Boolean(
+      element?.picElement
+      || element?.videoElement
+      || element?.pttElement
+      || element?.fileElement
+      || element?.marketFaceElement
+    ));
+  }
+
+  private hasUsefulReplySource(message: RawMessage): boolean {
+    if (this.hasMediaElements(message)) return true;
+    return (message?.elements || []).some((element: MessageElement) => {
+      if (!element) return false;
+      if (element.textElement) {
+        const text = String(element.textElement.content || '').trim();
+        if (!text) return false;
+        return !/^\[(?:图片|视频|语音|文件|空消息)\]$/.test(text);
+      }
+      return Boolean(
+        element.faceElement
+        || element.arkElement
+        || element.multiForwardMsgElement
+        || element.structLongMsgElement
+        || element.grayTipElement
+      );
+    });
+  }
+
+  private rawMessageFromReplySnapshot(parent: RawMessage, replyElement: any): RawMessage | null {
+    const source = Array.isArray(replyElement?.sourceMsgTextElems)
+      ? replyElement.sourceMsgTextElems
+      : [];
+    const elements: MessageElement[] = [];
+    for (const item of source) {
+      if (!item || typeof item !== 'object') continue;
+      const pic = item.picElem || item.picElement;
+      const video = item.videoElem || item.videoElement;
+      const ptt = item.pttElem || item.pttElement;
+      const file = item.fileElem || item.fileElement;
+      if (pic) {
+        elements.push({ elementType: 2, elementId: '', picElement: { ...pic } } as MessageElement);
+      } else if (video) {
+        elements.push({ elementType: 5, elementId: '', videoElement: { ...video } } as MessageElement);
+      } else if (ptt) {
+        elements.push({ elementType: 4, elementId: '', pttElement: { ...ptt } } as MessageElement);
+      } else if (file) {
+        elements.push({ elementType: 3, elementId: '', fileElement: { ...file } } as MessageElement);
+      } else {
+        const text = String(item.textElemContent ?? item.textElement?.content ?? '').trim();
+        if (text) {
+          elements.push({
+            elementType: 1,
+            elementId: '',
+            textElement: { content: text, atType: 0 }
+          } as MessageElement);
+        }
+      }
+    }
+    if (elements.length === 0) return null;
+
+    const sourceId = this.replySourceMessageId(replyElement)
+      || `${String(parent.msgId || 'message')}:reply`;
+    return {
+      ...(parent as any),
+      msgId: sourceId,
+      msgSeq: this.replySourceSequence(replyElement) || '0',
+      clientSeq: String(replyElement?.replyMsgClientSeq ?? this.replySourceSequence(replyElement) ?? '0'),
+      msgTime: String(replyElement?.replyMsgTime ?? parent.msgTime ?? '0'),
+      senderUid: String(replyElement?.senderUidStr ?? replyElement?.senderUid ?? ''),
+      senderUin: String(replyElement?.senderUin ?? ''),
+      sendNickName: String(replyElement?.senderNick ?? ''),
+      sendMemberName: String(replyElement?.senderMemberName ?? ''),
+      elements,
+      records: []
+    } as RawMessage;
+  }
+
+  private async fetchReplyRawMessageBySequence(
+    parent: RawMessage,
+    sequence: string
+  ): Promise<RawMessage | null> {
+    const bridge = (globalThis as any).__NAPCAT_BRIDGE__;
+    const msgApi = bridge?.core?.apis?.MsgApi || bridge?.core?.apis?.msg;
+    if (!msgApi) return null;
+    const peer = this.getForwardFetchContext(parent).peer;
+    const results: any[] = [];
+
+    if (typeof msgApi.getMsgsBySeqAndCount === 'function') {
+      try {
+        results.push(await msgApi.getMsgsBySeqAndCount(peer, sequence, 1, true, true));
+      } catch {
+        // 继续走单条查询兼容接口。
+      }
+    }
+    if (!this.findMessageInQueryResults(results, sequence)
+      && typeof msgApi.queryFirstMsgBySeq === 'function') {
+      try {
+        results.push(await msgApi.queryFirstMsgBySeq(peer, sequence));
+      } catch {
+        // 继续尝试过滤查询。
+      }
+    }
+    if (!this.findMessageInQueryResults(results, sequence)
+      && typeof msgApi.queryMsgsWithFilterExWithSeq === 'function') {
+      try {
+        results.push(await msgApi.queryMsgsWithFilterExWithSeq(peer, sequence));
+      } catch {
+        // 全部失败时由调用方使用 reply 快照。
+      }
+    }
+    return this.findMessageInQueryResults(results, sequence);
+  }
+
+  private findMessageInQueryResults(results: any[], sequence: string): RawMessage | null {
+    for (const result of results) {
+      const lists = [
+        result?.msgList,
+        result?.messages,
+        result?.data?.msgList,
+        result?.data?.messages,
+        Array.isArray(result) ? result : undefined
+      ];
+      for (const list of lists) {
+        if (!Array.isArray(list)) continue;
+        const found = list.find((message: RawMessage) =>
+          [message?.msgSeq, message?.clientSeq, (message as any)?.realSeq]
+            .some(value => value != null && String(value) === sequence)
+        );
+        if (found) return found;
+      }
+      if (result?.msgId && [result.msgSeq, result.clientSeq, result.realSeq]
+        .some((value: unknown) => value != null && String(value) === sequence)) {
+        return result as RawMessage;
+      }
+    }
+    return null;
+  }
+
+  private attachReplyFetchContext(
+    record: RawMessage,
+    parent: RawMessage,
+    replyElement: any,
+    replyIndex: number
+  ): void {
+    const context = this.getForwardFetchContext(parent);
+    if (!(record as any).chatType) (record as any).chatType = context.peer.chatType;
+    if (!(record as any).peerUid) (record as any).peerUid = context.peer.peerUid;
+    if (!(record as any).guildId) (record as any).guildId = context.peer.guildId;
+    (record as any).__qceForwardPeer = context.peer;
+    (record as any).__qceReplyRecord = true;
+    const parentKey = String((parent as any).__qceResourceKey || parent.msgId || 'message');
+    const sourceKey = this.replySourceMessageId(replyElement)
+      || this.replySourceSequence(replyElement)
+      || String(replyIndex + 1);
+    (record as any).__qceResourceKey = `${parentKey}/reply-${sourceKey}`;
   }
 
   private async fetchForwardRawMessagesForHydration(
@@ -1713,7 +2001,9 @@ export class SimpleMessageParser {
     let raws: RawMessage[] = [];
     const inlineRecords = (message as any).records;
     if (Array.isArray(inlineRecords) && inlineRecords.length > 0) {
-      raws = inlineRecords;
+      // hydrateReplyRecords 也会把引用原消息放进 records，但它不是
+      // 合并转发消息卡片的子节点，不能混进展开后的聊天记录。
+      raws = inlineRecords.filter((record: RawMessage) => !(record as any)?.__qceReplyRecord);
     }
 
     if (raws.length === 0) {
@@ -2184,25 +2474,30 @@ export class SimpleMessageParser {
         .map(value => value == null ? '' : String(value))
         .find(value => value && resourceMap.has(value));
       if (!resourceKey) continue;
-      const images = (resourceMap.get(resourceKey) || [])
+      const availableResources = (resourceMap.get(resourceKey) || [])
         // ResourceHandler 在下载失败时也会保留“计划写入”的 localPath；只有
         // accessible=true 才代表文件确实存在，避免 HTML 指向 ZIP 中不存在的文件。
-        .filter(resource => resource?.type === 'image'
+        .filter(resource => ['image', 'video', 'audio', 'file'].includes(resource?.type)
           && resource?.localPath
           && resource?.accessible === true
           && fs.existsSync(String(resource.localPath)))
         .map(resource => ({
+          type: String(resource.type),
           md5: String(resource.md5 || ''),
-          localPath: `images/${path.basename(String(resource.localPath))}`
+          localPath: `${String(resource.type)}s/${path.basename(String(resource.localPath))}`
         }));
-      if (images.length === 0) continue;
-      let fallbackIdx = 0;
+      if (availableResources.length === 0) continue;
+      const fallbackIndexes = new Map<string, number>();
       for (const preview of data.previewElements) {
-        if (preview.type !== 'image') continue;
-        const byMd5 = preview.md5 ? images.find(image => image.md5 && image.md5 === preview.md5) : undefined;
-        const candidate = byMd5 || images[fallbackIdx];
+        if (!['image', 'video', 'audio', 'file'].includes(preview.type)) continue;
+        const candidates = availableResources.filter(resource => resource.type === preview.type);
+        const fallbackIdx = fallbackIndexes.get(preview.type) || 0;
+        const byMd5 = preview.md5
+          ? candidates.find(resource => resource.md5 && resource.md5 === preview.md5)
+          : undefined;
+        const candidate = byMd5 || candidates[fallbackIdx];
         if (candidate) preview.localPath = candidate.localPath;
-        fallbackIdx++;
+        fallbackIndexes.set(preview.type, fallbackIdx + 1);
       }
     }
   }
@@ -2341,8 +2636,12 @@ export class SimpleMessageParser {
 
     // 4. 源消息不在导出范围内时，用 records 快照生成文字/缩略图，但绝不
     // 把 record.msgId 当成 DOM 跳转目标。
-    if (!referencedMessage && sourceMsgId && sourceMsgId !== '0') {
-      referencedMessage = message.records?.find((record: RawMessage) => String(record.msgId) === sourceMsgId)
+    if (!referencedMessage && ((sourceMsgId && sourceMsgId !== '0') || replyElement.replayMsgSeq != null)) {
+      referencedMessage = message.records?.find((record: RawMessage) =>
+        String(record.msgId) === sourceMsgId
+        || (replyElement.replayMsgSeq != null && [record.msgSeq, record.clientSeq, (record as any).realSeq]
+          .some(value => value != null && String(value) === String(replyElement.replayMsgSeq)))
+      )
         || this.messageMap.get(sourceMsgId);
       if (referencedMessage) source = 'records';
     }
@@ -2368,7 +2667,9 @@ export class SimpleMessageParser {
     } = {
       messageId: sourceMsgId || replyElement.replayMsgId || replyElement.replayMsgSeq || '0',
       referencedMessageId,
-      previewResourceMessageId: referencedMessage?.msgId ? String(referencedMessage.msgId) : (sourceMsgId || undefined),
+      previewResourceMessageId: referencedMessage
+        ? String((referencedMessage as any).__qceResourceKey || referencedMessage.msgId || sourceMsgId || '')
+        : (sourceMsgId || undefined),
       sourceAvailable: Boolean(referencedMessageId),
       senderUin: replyElement.senderUin || (referencedMessage?.senderUin ?? ''),
       senderName,

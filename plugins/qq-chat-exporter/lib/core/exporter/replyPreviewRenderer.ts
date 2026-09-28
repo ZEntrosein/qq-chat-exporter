@@ -74,16 +74,36 @@ export function renderReplyPreviewElement(pe: unknown, ctx: ReplyPreviewRenderCo
             return ctx.escapeHtml(friendly || text || '[表情]');
         }
         case 'video': {
-            // 短卡片里塞不下播放器，给个 🎬 + 文件名 / 占位。
             const label = e.fileName || text || '[视频]';
+            const localPath = typeof e.localPath === 'string' ? e.localPath : '';
+            if (localPath) {
+                const baseName = path.basename(localPath);
+                const dataUri = ctx.lookupDataUri('videos', baseName);
+                const src = dataUri || `${ctx.resourceBaseHref}/${localPath}`;
+                return `<video src="${ctx.escapeHtml(src)}" class="reply-content-video" controls preload="metadata" title="${ctx.escapeHtml(String(label))}" onclick="event.stopPropagation()"></video>`;
+            }
             return `<span class="reply-content-attachment">🎬 ${ctx.escapeHtml(String(label))}</span>`;
         }
         case 'audio': {
             const label = text || '[语音]';
+            const localPath = typeof e.localPath === 'string' ? e.localPath : '';
+            if (localPath) {
+                const baseName = path.basename(localPath);
+                const dataUri = ctx.lookupDataUri('audios', baseName);
+                const src = dataUri || `${ctx.resourceBaseHref}/${localPath}`;
+                return `<audio src="${ctx.escapeHtml(src)}" class="reply-content-audio" controls preload="metadata" title="${ctx.escapeHtml(String(label))}" onclick="event.stopPropagation()"></audio>`;
+            }
             return `<span class="reply-content-attachment">🎵 ${ctx.escapeHtml(String(label))}</span>`;
         }
         case 'file': {
             const label = e.fileName || text || '[文件]';
+            const localPath = typeof e.localPath === 'string' ? e.localPath : '';
+            if (localPath) {
+                const baseName = path.basename(localPath);
+                const dataUri = ctx.lookupDataUri('files', baseName);
+                const href = dataUri || `${ctx.resourceBaseHref}/${localPath}`;
+                return `<a class="reply-content-attachment" href="${ctx.escapeHtml(href)}" download="${ctx.escapeHtml(baseName)}" onclick="event.stopPropagation()">📎 ${ctx.escapeHtml(String(label))}</a>`;
+            }
             return `<span class="reply-content-attachment">📎 ${ctx.escapeHtml(String(label))}</span>`;
         }
         case 'text':
