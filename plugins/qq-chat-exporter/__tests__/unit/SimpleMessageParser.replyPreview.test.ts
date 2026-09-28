@@ -438,6 +438,85 @@ test('hydrateForwardRecords: 保留 forward.data.content 中的深层聊天记�
     }
 });
 
+test('hydrateForwardRecords: 兼容 NapCat parseForward 的 node.data.message 深层节点', async () => {
+    const previousBridge = (globalThis as any).__NAPCAT_BRIDGE__;
+    (globalThis as any).__NAPCAT_BRIDGE__ = {
+        core: { apis: {} },
+        actions: {
+            get(name: string) {
+                if (name !== 'get_forward_msg') return undefined;
+                return {
+                    async handle() {
+                        // 精确模拟当前 NapCat GoCQHTTPGetForwardMsgAction.parseForward：
+                        // 每条消息是 node，嵌套的聊天记录也是 node，并挂在 data.message。
+                        return {
+                            data: {
+                                messages: [{
+                                    type: 'node',
+                                    data: {
+                                        user_id: '10002',
+                                        nickname: '中层用户',
+                                        message: [{
+                                            type: 'node',
+                                            data: {
+                                                user_id: '10002',
+                                                nickname: '中层用户',
+                                                message: [{
+                                                    type: 'node',
+                                                    data: {
+                                                        user_id: '10003',
+                                                        nickname: '深层用户',
+                                                        message: [{ type: 'text', data: { text: '真实深层正文' } }],
+                                                        content: [],
+                                                    },
+                                                }],
+                                                content: [],
+                                            },
+                                        }],
+                                        content: [],
+                                    },
+                                }],
+                            },
+                        };
+                    },
+                };
+            },
+        },
+    };
+
+    try {
+        const parser = new SimpleMessageParser({ html: 'none' });
+        const top = rawMessage({
+            msgId: 'nested-node-message-top',
+            records: [],
+            elements: [{
+                multiForwardMsgElement: {
+                    resId: 'outer-node-forward',
+                    xmlContent: '<msg><summary>1条转发消息</summary></msg>',
+                },
+            }],
+        });
+
+        const hydrated = await parser.hydrateForwardRecords([top]);
+        assert.equal(hydrated, 1);
+        assert.equal(top.records[0].records[0].elements[0].textElement.content, '真实深层正文');
+
+        const [parsed] = await parser.parseMessages([top]);
+        const outer = parsed.content.elements.find(element => element.type === 'forward')!.data;
+        const nested = outer.messages[0].content.elements.find((element: any) => element.type === 'forward');
+        assert.ok(nested, 'node.data.message 应被还原为嵌套 forward 元素');
+        assert.equal(nested.data.messages[0].sender.name, '深层用户');
+        assert.equal(nested.data.messages[0].content.text, '真实深层正文');
+        assert.doesNotMatch(nested.data.messages[0].content.text, /\[空消息\]/);
+    } finally {
+        if (previousBridge === undefined) {
+            delete (globalThis as any).__NAPCAT_BRIDGE__;
+        } else {
+            (globalThis as any).__NAPCAT_BRIDGE__ = previousBridge;
+        }
+    }
+});
+
 test('hydrateForwardRecords: 相同的转发节点 msgId 使用序号生成独立资源键', async () => {
     const previousBridge = (globalThis as any).__NAPCAT_BRIDGE__;
     (globalThis as any).__NAPCAT_BRIDGE__ = {

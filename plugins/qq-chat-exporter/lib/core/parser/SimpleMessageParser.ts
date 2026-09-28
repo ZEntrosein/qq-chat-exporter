@@ -523,11 +523,20 @@ export class SimpleMessageParser {
         // forward.data.content，而不保证这些内层卡片还能再次按 id 拉取。
         // 这里将内联内容提前还原为 records，避免后续递归解析时丢成空消息。
         if (depth < SimpleMessageParser.MAX_FORWARD_DEPTH) {
-          const inlineMessages = segments.flatMap((segment: any) =>
-            String(segment?.type || '').toLowerCase() === 'forward'
-              ? this.getOneBotForwardContentEntries(segment?.data?.content)
-              : []
-          );
+          const inlineMessages = segments.flatMap((segment: any) => {
+            const type = String(segment?.type || '').toLowerCase();
+            if (type === 'forward') {
+              return this.getOneBotForwardContentEntries(
+                segment?.data?.content ?? segment?.data?.message
+              );
+            }
+            // NapCat 当前的 get_forward_msg.parseForward 会把嵌套转发改写成
+            // node.data.message = node[]，而不是保留 forward.data.content。
+            if (type === 'node') {
+              return this.getOneBotForwardContentEntries(this.getOneBotNodeSegments(segment));
+            }
+            return [];
+          });
           if (inlineMessages.length > 0) {
             raw.records = this.normalizeForwardActionRawMessages(inlineMessages, raw, depth + 1);
           }
@@ -540,12 +549,13 @@ export class SimpleMessageParser {
   /**
    * 兼容 get_forward_msg 的两种子消息形态：
    * 1) NapCat 当前返回的完整 OneBot 消息（message: MessageSegment[]）
-   * 2) node 包装（data.content: MessageSegment[]）
+   * 2) node 包装（旧版 data.content / 当前 NapCat data.message）
    */
   private normalizeOneBotForwardEntries(entries: any[]): any[] {
     if (!Array.isArray(entries)) return [];
     return entries.map((entry: any, index: number) => {
-      if (String(entry?.type || '').toLowerCase() !== 'node' || !Array.isArray(entry?.data?.content)) {
+      const nodeSegments = this.getOneBotNodeSegments(entry);
+      if (String(entry?.type || '').toLowerCase() !== 'node' || nodeSegments.length === 0) {
         return entry;
       }
       const data = entry.data || {};
@@ -561,7 +571,7 @@ export class SimpleMessageParser {
           nickname: data.nickname ?? data.name ?? String(userId),
           card: data.card ?? ''
         },
-        message: data.content,
+        message: nodeSegments,
         raw_message: data.raw_message ?? ''
       };
     });
@@ -569,9 +579,21 @@ export class SimpleMessageParser {
 
   private getOneBotMessageSegments(item: any): any[] {
     if (Array.isArray(item?.message)) return item.message;
-    if (String(item?.type || '').toLowerCase() === 'node' && Array.isArray(item?.data?.content)) {
-      return item.data.content;
+    if (String(item?.type || '').toLowerCase() === 'node') {
+      return this.getOneBotNodeSegments(item);
     }
+    return [];
+  }
+
+  /**
+   * NapCat 的 get_forward_msg 在不同版本中用过两套 node 子消息字段：
+   * data.content（旧形态）与 data.message（当前 parseForward 真实输出）。
+   */
+  private getOneBotNodeSegments(node: any): any[] {
+    if (Array.isArray(node?.data?.message) && node.data.message.length > 0) {
+      return node.data.message;
+    }
+    if (Array.isArray(node?.data?.content)) return node.data.content;
     return [];
   }
 
@@ -707,6 +729,18 @@ export class SimpleMessageParser {
         multiForwardMsgElement: {
           resId: String(data.id || data.res_id || data.resId || ''),
           xmlContent: String(data.content || '')
+        }
+      } as unknown as MessageElement;
+    }
+    if (type === 'node') {
+      const nodeSegments = this.getOneBotNodeSegments(segment);
+      if (nodeSegments.length === 0) return null;
+      return {
+        elementType: 16,
+        elementId,
+        multiForwardMsgElement: {
+          resId: String(data.id || data.res_id || data.resId || ''),
+          xmlContent: ''
         }
       } as unknown as MessageElement;
     }
@@ -1727,9 +1761,13 @@ export class SimpleMessageParser {
       const elements = this.getOneBotMessageSegments(item).map((element: any) => {
         const type = String(element?.type || 'unknown').toLowerCase();
         const data = element?.data || {};
-        if (type !== 'forward') return { type, data };
+        if (type !== 'forward' && type !== 'node') return { type, data };
 
-        const contentEntries = this.getOneBotForwardContentEntries(data.content);
+        const contentEntries = this.getOneBotForwardContentEntries(
+          type === 'node'
+            ? this.getOneBotNodeSegments(element)
+            : (data.content ?? data.message)
+        );
         const innerMessages = depth < SimpleMessageParser.MAX_FORWARD_DEPTH
           ? this.normalizeForwardActionMessages(contentEntries, depth + 1)
           : [];
