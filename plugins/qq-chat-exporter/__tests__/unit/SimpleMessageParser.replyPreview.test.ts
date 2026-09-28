@@ -259,3 +259,154 @@ test('backfillReplyPreviewLocalPathsFromResourceMap: 下载失败的计划路径
     assert.equal(preview.localPath, undefined);
     assert.equal(preview.originUrl, 'http://q.qq/fallback');
 });
+
+test('parseMessagesStream: 合并转发子消息媒体从 resourceMap 回填离线路径', async () => {
+    const parser = new SimpleMessageParser({ html: 'none' });
+    const child = rawMessage({
+        msgId: 'forward-child',
+        msgSeq: '8801',
+        elements: [{ picElement: { md5HexStr: 'forward-md5', fileName: 'inside.jpg' } }],
+    });
+    const top = rawMessage({
+        msgId: 'forward-top',
+        msgSeq: '8802',
+        records: [child],
+        elements: [{
+            multiForwardMsgElement: {
+                resId: 'forward-res-id',
+                xmlContent: '<msg><summary>1条转发消息</summary></msg>',
+            },
+        }],
+    });
+    const resourceMap = new Map([
+        ['forward-child', [{
+            type: 'image',
+            md5: 'forward-md5',
+            localPath: process.execPath,
+            accessible: true,
+        }]],
+    ]);
+
+    const parsed: CleanMessage[] = [];
+    for await (const message of parser.parseMessagesStream([top], resourceMap)) parsed.push(message);
+    const forward = parsed[0]!.content.elements.find(element => element.type === 'forward')!.data;
+    const image = forward.messages[0].content.elements.find((element: any) => element.type === 'image');
+
+    assert.equal(image.data.localPath, `images/${process.platform === 'win32' ? 'node.exe' : 'node'}`);
+    assert.equal(image.data.url, `resources/images/${process.platform === 'win32' ? 'node.exe' : 'node'}`);
+});
+
+test('hydrateForwardRecords: 在资源扫描前把 get_forward_msg 子消息转换为原始 records', async () => {
+    const previousBridge = (globalThis as any).__NAPCAT_BRIDGE__;
+    const calls: string[] = [];
+    (globalThis as any).__NAPCAT_BRIDGE__ = {
+        core: { apis: {} },
+        actions: {
+            get(name: string) {
+                if (name !== 'get_forward_msg') return undefined;
+                return {
+                    async handle(payload: any) {
+                        calls.push(String(payload.message_id));
+                        return {
+                            data: {
+                                messages: [{
+                                    message_id: 'forward-child-action',
+                                    message_seq: 8810,
+                                    time: 1700000100,
+                                    user_id: 10002,
+                                    sender: { nickname: '转发用户', card: '群名片' },
+                                    message: [{
+                                        type: 'image',
+                                        data: {
+                                            file: '0123456789abcdef0123456789abcdef.image',
+                                            url: 'https://multimedia.nt.qq.com.cn/download?appid=1407',
+                                            file_size: 1234,
+                                            width: 640,
+                                            height: 480,
+                                        },
+                                    }],
+                                }],
+                            },
+                        };
+                    },
+                };
+            },
+        },
+    };
+
+    try {
+        const parser = new SimpleMessageParser({ html: 'none' });
+        const top = rawMessage({
+            msgId: 'forward-top-action',
+            records: [],
+            elements: [{
+                multiForwardMsgElement: {
+                    resId: 'forward-res-action',
+                    xmlContent: '<msg><summary>1条转发消息</summary></msg>',
+                },
+            }],
+        });
+
+        const hydrated = await parser.hydrateForwardRecords([top]);
+        assert.equal(hydrated, 1);
+        assert.deepEqual(calls, ['forward-top-action']);
+        assert.equal(top.records.length, 1);
+        assert.equal(top.records[0].msgId, 'forward-child-action');
+        assert.equal(top.records[0].sendMemberName, '群名片');
+        const picture = top.records[0].elements[0].picElement;
+        assert.equal(picture.md5HexStr, '0123456789abcdef0123456789abcdef');
+        assert.equal(picture.originImageUrl, 'https://multimedia.nt.qq.com.cn/download?appid=1407');
+        assert.equal(picture.sourcePath, 'https://multimedia.nt.qq.com.cn/download?appid=1407');
+    } finally {
+        if (previousBridge === undefined) {
+            delete (globalThis as any).__NAPCAT_BRIDGE__;
+        } else {
+            (globalThis as any).__NAPCAT_BRIDGE__ = previousBridge;
+        }
+    }
+});
+
+test('hydrateForwardRecords: 相同的转发节点 msgId 使用序号生成独立资源键', async () => {
+    const previousBridge = (globalThis as any).__NAPCAT_BRIDGE__;
+    (globalThis as any).__NAPCAT_BRIDGE__ = {
+        core: {
+            apis: {
+                MsgApi: {
+                    async getMultiMsg() {
+                        return {
+                            msgList: [
+                                rawMessage({ msgId: 'shared-id', msgSeq: 'same', clientSeq: '53767' }),
+                                rawMessage({ msgId: 'shared-id', msgSeq: 'same', clientSeq: '53768' }),
+                                rawMessage({ msgId: 'shared-id', msgSeq: 'same', clientSeq: '53769' }),
+                            ],
+                        };
+                    },
+                },
+            },
+        },
+        actions: { get() { return undefined; } },
+    };
+
+    try {
+        const parser = new SimpleMessageParser({ html: 'none' });
+        const top = rawMessage({
+            msgId: 'forward-top-duplicate-id',
+            records: [],
+            elements: [{ multiForwardMsgElement: { resId: 'duplicate-res-id', xmlContent: '' } }],
+        });
+
+        await parser.hydrateForwardRecords([top]);
+        assert.deepEqual(top.records.map((record: any) => record.msgId), [
+            'shared-id', 'shared-id', 'shared-id',
+        ]);
+        assert.deepEqual(top.records.map((record: any) => record.__qceResourceKey), [
+            'shared-id-53767', 'shared-id-53768', 'shared-id-53769',
+        ]);
+    } finally {
+        if (previousBridge === undefined) {
+            delete (globalThis as any).__NAPCAT_BRIDGE__;
+        } else {
+            (globalThis as any).__NAPCAT_BRIDGE__ = previousBridge;
+        }
+    }
+});

@@ -885,9 +885,14 @@ export class ModernHtmlExporter {
             }
         }
 
-        // elements 中的资源元素
         if (c?.elements && Array.isArray(c.elements)) {
-            for (const el of c.elements as any[]) {
+            yield* this.iterElementResources(c.elements);
+        }
+    }
+
+    /** 合并转发详情里的媒体也要复制/内联，保证展开后仍能离线查看。 */
+    private *iterElementResources(elements: any[]): Iterable<ResourceTask> {
+        for (const el of elements) {
                 const data = el?.data;
                 const elType = el?.type || 'file';
 
@@ -903,6 +908,16 @@ export class ModernHtmlExporter {
                             url: preview.originUrl
                         };
                     }
+                }
+
+                if (elType === 'forward' && Array.isArray(data?.messages)) {
+                    for (const innerMessage of data.messages) {
+                        const innerElements = innerMessage?.content?.elements;
+                        if (Array.isArray(innerElements)) {
+                            yield* this.iterElementResources(innerElements);
+                        }
+                    }
+                    continue;
                 }
                 
                 // 优先使用有效的 localPath
@@ -926,7 +941,6 @@ export class ModernHtmlExporter {
                         };
                     }
                 }
-            }
         }
     }
 
@@ -1407,7 +1421,7 @@ export class ModernHtmlExporter {
     }
 
     private renderImageElement(data: any): string {
-        const filename = data?.filename || '图片';
+        const filename = data?.filename || data?.file || data?.name || '图片';
         let src = '';
 
         // 优先使用localPath（导出后的本地资源）
@@ -1417,12 +1431,8 @@ export class ModernHtmlExporter {
             const dataUri = this.lookupDataUri('images', baseName);
             src = dataUri || `${this.resourceBaseHref}/images/${baseName}`;
         }
-        // 如果有 filename，尝试使用本地资源路径（用于分块导出模式）
-        else if (data?.filename && this.options.includeResourceLinks) {
-            const dataUri = this.lookupDataUri('images', data.filename);
-            src = dataUri || `${this.resourceBaseHref}/images/${data.filename}`;
-        }
-        // 其次使用url，但要过滤掉无效的file://协议路径
+        // 下载失败时保留仍可能有效的远程 URL，避免把仅有 filename 的资源误画成
+        // 一个并不存在的 ./resources/images/... 本地文件。
         else if (data?.url) {
             const url = data.url;
             // 过滤掉file://协议和本地文件系统路径
@@ -1432,6 +1442,11 @@ export class ModernHtmlExporter {
                 !url.match(/^[A-Z]:\\/)) {
                 src = url;
             }
+        }
+        // 没有 URL 时再按 filename 尝试本地资源（用于分块导出模式）。
+        else if (data?.filename && this.options.includeResourceLinks) {
+            const dataUri = this.lookupDataUri('images', data.filename);
+            src = dataUri || `${this.resourceBaseHref}/images/${data.filename}`;
         }
 
         if (src) {
@@ -1445,7 +1460,7 @@ export class ModernHtmlExporter {
 
     private renderAudioElement(data: any): string {
         const duration = data?.duration || 0;
-        const filename = data?.filename || '语音';
+        const filename = data?.filename || data?.file || data?.name || '语音';
         let src = '';
 
         // 优先使用localPath（导出后的本地资源，使用相对路径）
@@ -1488,7 +1503,7 @@ export class ModernHtmlExporter {
     }
 
     private renderVideoElement(data: any): string {
-        const filename = data?.filename || '视频';
+        const filename = data?.filename || data?.file || data?.name || '视频';
         let src = '';
 
         // 优先使用localPath（导出后的本地资源，使用相对路径）
@@ -1521,7 +1536,7 @@ export class ModernHtmlExporter {
     }
 
     private renderFileElement(data: any): string {
-        const filename = data?.filename || '文件';
+        const filename = data?.filename || data?.file || data?.name || '文件';
         let href = '';
 
         // 优先使用localPath（导出后的本地资源）
@@ -1712,6 +1727,98 @@ export class ModernHtmlExporter {
         </div>`;
     }
 
+    private renderForwardInnerContent(message: any, depth: number): string {
+        const elements = Array.isArray(message?.content?.elements) ? message.content.elements : [];
+        let result = '';
+
+        for (const element of elements) {
+            switch (element?.type) {
+                case 'text':
+                    result += this.renderTextElement(element.data);
+                    break;
+                case 'image':
+                    result += this.renderImageElement(element.data);
+                    break;
+                case 'audio':
+                    result += this.renderAudioElement(element.data);
+                    break;
+                case 'video':
+                    result += this.renderVideoElement(element.data);
+                    break;
+                case 'file':
+                    result += this.renderFileElement(element.data);
+                    break;
+                case 'face':
+                    result += this.renderFaceElement(element.data);
+                    break;
+                case 'market_face':
+                    result += this.renderMarketFaceElement(element.data);
+                    break;
+                case 'at': {
+                    const name = element?.data?.name || '某人';
+                    result += `<span class="at-mention">@${this.escapeHtml(name)}</span>`;
+                    break;
+                }
+                case 'reply':
+                    result += this.renderReplyElement(element.data);
+                    break;
+                case 'json':
+                    result += this.renderJsonElement(element.data);
+                    break;
+                case 'forward':
+                    result += depth < 3
+                        ? this.renderForwardElement(element.data, depth + 1)
+                        : `<span class="text-content">[嵌套转发层级过深]</span>`;
+                    break;
+                case 'system':
+                    result += this.renderSystemElement(element.data);
+                    break;
+                case 'location':
+                    result += this.renderLocationElement(element.data);
+                    break;
+                default: {
+                    const rawText = element?.data?.text || element?.data?.summary || element?.data?.content || '';
+                    if (rawText) result += `<span class="text-content">${this.escapeHtml(rawText)}</span>`;
+                }
+            }
+        }
+
+        if (result) return result;
+        const fallback = typeof message?.content?.text === 'string' ? message.content.text : '';
+        return `<span class="text-content">${this.escapeHtml(fallback || '[空消息]')}</span>`;
+    }
+
+    private getForwardPreviewText(message: any): string {
+        const elements = Array.isArray(message?.content?.elements) ? message.content.elements : [];
+        const raw = typeof message?.content?.text === 'string' ? message.content.text : '';
+        if (elements.some((element: any) => element?.type === 'forward') && /^\[(?:转发消息|合并转发)/.test(raw.trim())) {
+            return '[聊天记录]';
+        }
+        const cleaned = raw
+            .replace(/\[(图片|视频|文件|语音):(undefined|null)?\]/g, '[$1]')
+            .replace(/\[图片:(?:[a-f0-9]{32})(?:\.[a-z0-9]+)?\]/gi, '[图片]')
+            .replace(/\s+/g, ' ')
+            .trim();
+        if (cleaned) return cleaned;
+
+        const labels = elements
+            .map((element: any) => {
+                switch (element?.type) {
+                    case 'image': return '[图片]';
+                    case 'video': return '[视频]';
+                    case 'audio': return '[语音]';
+                    case 'file': return `[文件: ${element?.data?.filename || element?.data?.file || '文件'}]`;
+                    case 'face': return element?.data?.name || '[表情]';
+                    case 'market_face': return `[${element?.data?.name || '表情'}]`;
+                    case 'forward': return '[聊天记录]';
+                    default: return element?.data?.text || '';
+                }
+            })
+            .filter(Boolean);
+        return (labels.join(' ') || '[空消息]')
+            .replace(/\[图片:(?:[a-f0-9]{32})(?:\.[a-z0-9]+)?\]/gi, '[图片]');
+    }
+
     private renderForwardElement(data: any, depth: number = 0): string {
         const title = data?.title || '聊天记录';
         const rawSummary = typeof data?.summary === 'string' ? data.summary : (typeof data?.content === 'string' ? data.content : '');
@@ -1727,24 +1834,13 @@ export class ModernHtmlExporter {
             content?: { text?: string; elements?: Array<{ type?: string; data?: any }> };
         }> = Array.isArray(data?.messages) ? data.messages : [];
         const messageCount: number = typeof data?.messageCount === 'number' ? data.messageCount : innerMessages.length;
-        // issue #434：子消息本身可能又是一条合并转发（嵌套[聊天记录]），递归展开成内层卡片。
-        // 解析器侧 MAX_FORWARD_DEPTH=3，这里用同样的上限兜底异常数据。
-        const MAX_RENDER_DEPTH = 3;
-
         let previewHtml = '';
         if (innerMessages.length > 0) {
             previewHtml = innerMessages.slice(0, 5).map((m) => {
                 const name = this.escapeHtml(m?.sender?.name || (m?.sender?.uin ? String(m.sender.uin) : '未知'));
-                const text = (m?.content?.text || '').replace(/\s+/g, ' ').trim();
+                const text = this.getForwardPreviewText(m);
                 const trimmed = text.length > 60 ? text.slice(0, 60) + '…' : text;
-                const nestedForwards = depth < MAX_RENDER_DEPTH && Array.isArray(m?.content?.elements)
-                    ? m.content!.elements.filter((el) => el?.type === 'forward' && el?.data)
-                    : [];
-                const nestedHtml = nestedForwards.map((el) => this.renderForwardElement(el.data, depth + 1)).join('');
-                // 子消息只是一条嵌套转发时，正文就是"[转发消息: N条]"这类占位，已由内层卡片表达，去掉避免重复。
-                const bodyText = nestedHtml && /^\[转发消息/.test(text) ? '' : trimmed;
-                const bodyHtml = bodyText ? `<span class="forward-card-body">${this.escapeHtml(bodyText)}</span>` : '';
-                return `<div class="forward-card-line"><span class="forward-card-sender">${name}:</span> ${bodyHtml}${nestedHtml}</div>`;
+                return `<div class="forward-card-line"><span class="forward-card-sender">${name}:</span> <span class="forward-card-body">${this.escapeHtml(trimmed)}</span></div>`;
             }).join('');
         } else if (Array.isArray(preview) && preview.length > 0) {
             previewHtml = preview.slice(0, 5).map((line: any) => {
@@ -1758,9 +1854,8 @@ export class ModernHtmlExporter {
         }
 
         const footerLabel = messageCount > 0 ? `转发消息 · ${messageCount}条` : '转发消息';
-
-        return `<div class="forward-card${depth > 0 ? ' forward-card-nested' : ''}">
-            <div class="forward-card-header">
+        const nestedClass = depth > 0 ? ' forward-card-nested' : '';
+        const summaryHtml = `<div class="forward-card-header">
                 <svg class="forward-card-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
                     <path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
                 </svg>
@@ -1768,9 +1863,39 @@ export class ModernHtmlExporter {
             </div>
             <div class="forward-card-content">
                 ${previewHtml || '点击查看转发的聊天记录'}
-            </div>
-            <div class="forward-card-footer">${this.escapeHtml(footerLabel)}</div>
-        </div>`;
+            </div>`;
+
+        if (innerMessages.length === 0) {
+            return `<div class="forward-card forward-card-unavailable${nestedClass}">
+                ${summaryHtml}
+                <div class="forward-card-footer"><span>${this.escapeHtml(footerLabel)} · 详情未随导出保存</span></div>
+            </div>`;
+        }
+
+        const detailHtml = innerMessages.map((message) => {
+            const senderName = message?.sender?.name || (message?.sender?.uin ? String(message.sender.uin) : '未知');
+            const time = this.formatTime(message?.time || message?.timestamp);
+            const content = this.renderForwardInnerContent(message, depth);
+            return `<div class="forward-message-item">
+                <div class="forward-message-meta">
+                    <span class="forward-message-sender">${this.escapeHtml(senderName)}</span>
+                    ${time ? `<time class="forward-message-time">${this.escapeHtml(time)}</time>` : ''}
+                </div>
+                <div class="forward-message-content">${content}</div>
+            </div>`;
+        }).join('');
+
+        return `<details class="forward-card forward-card-expandable${nestedClass}">
+            <summary class="forward-card-summary" aria-label="展开或收起转发的聊天记录">
+                ${summaryHtml}
+                <div class="forward-card-footer">
+                    <span>${this.escapeHtml(footerLabel)}</span>
+                    <span class="forward-card-action forward-card-action-expand">展开</span>
+                    <span class="forward-card-action forward-card-action-collapse">收起</span>
+                </div>
+            </summary>
+            <div class="forward-card-details">${detailHtml}</div>
+        </details>`;
     }
 
     private renderSystemElement(data: any): string {

@@ -3994,6 +3994,16 @@ export class QQChatExporterApiServer {
                     console.info(`[ApiServer] 跳过下载的资源类型: ${normalizedSkipTypes.join(', ')}`);
                 }
 
+                // 合并转发详情不是顶层消息的一部分。先把它们取回并挂到 records，
+                // ResourceHandler 才能扫描、下载详情里的媒体资源。
+                if (format.toUpperCase() === 'HTML') {
+                    const forwardHydrator = new SimpleMessageParser({ html: 'none' });
+                    const hydratedForwardCount = await forwardHydrator.hydrateForwardRecords(filteredMessages);
+                    if (hydratedForwardCount > 0) {
+                        console.info(`[ApiServer] 已预取 ${hydratedForwardCount} 条合并转发详情`);
+                    }
+                }
+
                 // 下载和处理资源（使用过滤后的消息列表）
                 resourceMap = await taskResourceHandler.processMessageResources(filteredMessages);
                 resourceSummary = taskResourceHandler.getLastBatchSummary();
@@ -4464,9 +4474,11 @@ export class QQChatExporterApiServer {
                 filteredBatch = filteredBatch.filter((msg: any) => senderFilter(msg.senderUin));
             }
 
+            let batchResourceMap: Map<string, any[]> | undefined;
             if (options.processResources && filteredBatch.length > 0 && options.resourceHandler) {
                 try {
-                    await options.resourceHandler.processMessageResources(filteredBatch);
+                    await parser.hydrateForwardRecords(filteredBatch);
+                    batchResourceMap = await options.resourceHandler.processMessageResources(filteredBatch);
                 } catch (error) {
                     console.warn(`[StreamingExport] 批次 ${batchCount} 资源处理失败:`, error);
                 }
@@ -4478,6 +4490,9 @@ export class QQChatExporterApiServer {
                 if (cleanMsg) {
                     cleanBatch.push(cleanMsg);
                 }
+            }
+            if (batchResourceMap) {
+                await parser.updateResourcePaths(cleanBatch, batchResourceMap);
             }
 
             cleanBatch.sort((a, b) => this.compareCleanMessagesChronologically(a, b));

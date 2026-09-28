@@ -1101,6 +1101,43 @@ export const MODERN_CSS = `
             cursor: default;
             transition: all 0.2s;
         }
+
+        details.forward-card-expandable {
+            padding: 0;
+            min-width: min(520px, 62vw);
+            overflow: hidden;
+        }
+
+        .forward-card-summary {
+            display: block;
+            list-style: none;
+            padding: 12px 16px;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .forward-card-summary::-webkit-details-marker {
+            display: none;
+        }
+
+        .forward-card-summary::marker {
+            display: none;
+            content: '';
+        }
+
+        .forward-card-summary:focus-visible {
+            outline: 2px solid var(--accent-color);
+            outline-offset: -2px;
+            border-radius: 11px;
+        }
+
+        details.forward-card-expandable[open] > .forward-card-summary {
+            border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+        }
+
+        [data-theme="dark"] details.forward-card-expandable[open] > .forward-card-summary {
+            border-bottom-color: rgba(255, 255, 255, 0.1);
+        }
         
         [data-theme="dark"] .forward-card {
             border-color: rgba(255, 255, 255, 0.1);
@@ -1147,7 +1184,105 @@ export const MODERN_CSS = `
             margin-top: 8px;
             font-size: 12px;
             color: var(--text-tertiary);
-            text-align: right;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .forward-card-action {
+            color: var(--accent-color);
+            font-weight: 600;
+        }
+
+        .forward-card-action-collapse {
+            display: none;
+        }
+
+        details.forward-card-expandable[open] > .forward-card-summary .forward-card-action-expand {
+            display: none;
+        }
+
+        details.forward-card-expandable[open] > .forward-card-summary .forward-card-action-collapse {
+            display: inline;
+        }
+
+        .forward-card-details {
+            max-height: min(68vh, 680px);
+            overflow-y: auto;
+            overscroll-behavior: contain;
+            padding: 8px 16px 16px;
+            cursor: default;
+            scrollbar-gutter: stable;
+        }
+
+        .forward-message-item {
+            padding: 12px 0;
+            border-bottom: 1px solid rgba(0, 0, 0, 0.07);
+        }
+
+        .forward-message-item:last-child {
+            border-bottom: 0;
+        }
+
+        [data-theme="dark"] .forward-message-item {
+            border-bottom-color: rgba(255, 255, 255, 0.09);
+        }
+
+        .forward-message-meta {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            gap: 16px;
+            margin-bottom: 6px;
+        }
+
+        .forward-message-sender {
+            color: var(--text-primary);
+            font-size: 13px;
+            font-weight: 600;
+            overflow-wrap: anywhere;
+        }
+
+        .forward-message-time {
+            color: var(--text-tertiary);
+            font-size: 11px;
+            white-space: nowrap;
+        }
+
+        .forward-message-content {
+            color: var(--text-primary);
+            font-size: 14px;
+            line-height: 1.55;
+            user-select: text;
+            overflow-wrap: anywhere;
+        }
+
+        .forward-message-content .image-content {
+            max-width: 260px;
+        }
+
+        .forward-card-unavailable .forward-card-footer {
+            justify-content: flex-end;
+        }
+
+        @media (max-width: 720px) {
+            details.forward-card-expandable {
+                min-width: min(78vw, 520px);
+            }
+
+            .forward-card-details {
+                max-height: 62vh;
+            }
+
+            .forward-message-meta {
+                display: block;
+            }
+
+            .forward-message-time {
+                display: block;
+                margin-top: 2px;
+            }
         }
         
         /* 图片模态框 */

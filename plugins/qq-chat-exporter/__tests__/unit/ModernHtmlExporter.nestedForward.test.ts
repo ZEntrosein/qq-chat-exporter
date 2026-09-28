@@ -125,3 +125,109 @@ test('forward render depth is capped to avoid runaway nesting (#434)', async () 
     // 不抛错即视为通过；浅层应渲染出来。
     assert.ok(html.includes('第6层') || html.includes('第5层'), 'shallow nesting levels should render');
 });
+
+test('merged-forward card expands to every inner message with rich media', async () => {
+    const innerMessages = Array.from({ length: 7 }, (_, index) => ({
+        id: `inner-${index}`,
+        timestamp: Date.UTC(2026, 0, 1, 8, index),
+        time: new Date(Date.UTC(2026, 0, 1, 8, index)).toISOString(),
+        sender: { name: `成员${index + 1}` },
+        content: {
+            text: index === 0 ? '[图片:detail.png]' : `完整消息${index + 1}`,
+            elements: index === 0
+                ? [{ type: 'image', data: { filename: 'detail.png', localPath: 'images/detail.png' } }]
+                : [{ type: 'text', data: { text: `完整消息${index + 1}` } }],
+        },
+    }));
+    const message: any = {
+        id: 'm_expandable',
+        timestamp: Date.now(),
+        sender: { id: 'u_alice', uin: '11111', name: 'Alice' },
+        content: {
+            elements: [{
+                type: 'forward',
+                data: { title: '项目讨论', messageCount: innerMessages.length, messages: innerMessages },
+            }],
+        },
+    };
+
+    const html = await renderMessage(message);
+
+    assert.ok(html.includes('<details class="forward-card forward-card-expandable">'));
+    assert.ok(html.includes('<summary class="forward-card-summary"'));
+    assert.ok(html.includes('forward-card-action-expand">展开'));
+    assert.ok(html.includes('forward-card-action-collapse">收起'));
+    assert.equal((html.match(/class="forward-message-item"/g) || []).length, 7);
+    assert.ok(html.includes('完整消息7'), 'messages beyond the five-line preview must be retained');
+    assert.ok(html.includes('src="./resources/images/detail.png"'), 'inner images should render in details');
+    assert.ok(html.includes('<time class="forward-message-time">'), 'inner message timestamps should render');
+});
+
+test('forward cards without saved inner messages explain why they cannot expand', async () => {
+    const html = await renderMessage({
+        id: 'm_unavailable',
+        timestamp: Date.now(),
+        sender: { id: 'u_alice', name: 'Alice' },
+        content: {
+            elements: [{
+                type: 'forward',
+                data: { title: '聊天记录', messageCount: 12, messages: [] },
+            }],
+        },
+    });
+
+    assert.ok(html.includes('forward-card-unavailable'));
+    assert.ok(html.includes('详情未随导出保存'));
+    assert.ok(!html.includes('<details class="forward-card forward-card-expandable'));
+});
+
+test('forward preview hides bare media hashes from OneBot filenames', () => {
+    const exporter = new ModernHtmlExporter({ outputPath: 'unused.html' });
+    const html = (exporter as any).renderForwardElement({
+        title: '聊天记录',
+        messages: [{
+            id: 'child-1',
+            timestamp: 1700000000000,
+            sender: { name: '用户' },
+            content: {
+                text: '[图片:8d0e5bf2171d671429eac107b9590a9c]',
+                elements: [{
+                    type: 'image',
+                    data: { filename: '8d0e5bf2171d671429eac107b9590a9c' },
+                }],
+            },
+        }],
+    });
+
+    const previewBody = html.match(/forward-card-body">([^<]+)</)?.[1] || '';
+    assert.equal(previewBody, '[图片]');
+    assert.doesNotMatch(previewBody, /8d0e5bf2171d671429eac107b9590a9c/);
+});
+
+test('resource collection descends into merged-forward details', () => {
+    const exporter = new ModernHtmlExporter({
+        outputPath: path.join(tmp.path, 'out', 'chat.html'),
+        includeResourceLinks: true,
+    }) as any;
+    const resources = Array.from(exporter.iterResources({
+        content: {
+            resources: [],
+            elements: [{
+                type: 'forward',
+                data: {
+                    messages: [{
+                        content: {
+                            elements: [
+                                { type: 'image', data: { filename: 'inner.jpg', localPath: 'images/inner.jpg' } },
+                                { type: 'video', data: { filename: 'inner.mp4', localPath: 'videos/inner.mp4' } },
+                            ],
+                        },
+                    }],
+                },
+            }],
+        },
+    }));
+
+    assert.deepEqual(resources.map((resource: any) => resource.type), ['image', 'video']);
+    assert.deepEqual(resources.map((resource: any) => resource.fileName), ['inner.jpg', 'inner.mp4']);
+});

@@ -343,6 +343,319 @@ export class SimpleMessageParser {
   }
 
   /**
+   * 在资源扫描之前预取合并转发里的原始消息。
+   *
+   * 合并转发详情通常要通过 getMultiMsg / get_forward_msg 另取；如果等到
+   * parseElement 才取，ResourceHandler 已经结束扫描，子消息图片就只能保留
+   * 临时 CDN 地址。这里把详情写回 message.records，让原有资源处理流程自然
+   * 递归扫描它们，同时也避免真正解析 HTML 时再次请求同一份详情。
+   */
+  async hydrateForwardRecords(messages: RawMessage[]): Promise<number> {
+    const visited = new WeakSet<object>();
+    let hydratedCount = 0;
+
+    const walk = async (message: RawMessage, depth: number): Promise<void> => {
+      if (!message || depth > SimpleMessageParser.MAX_FORWARD_DEPTH) return;
+      if (typeof message === 'object') {
+        if (visited.has(message as object)) return;
+        visited.add(message as object);
+      }
+
+      const forwardElements = (message.elements || [])
+        .filter((element) => !!element?.multiForwardMsgElement);
+      let records = Array.isArray((message as any).records)
+        ? ((message as any).records as RawMessage[]).filter(Boolean)
+        : [];
+
+      if (records.length > 0 && forwardElements.length > 0) {
+        records = this.assignForwardResourceKeys(records, message);
+        (message as any).records = records;
+      }
+
+      if (forwardElements.length > 0 && records.length === 0) {
+        for (const element of forwardElements) {
+          const forward = element.multiForwardMsgElement!;
+          const xmlResId = (forward.xmlContent || '').match(/m_resid="([^"]+)"/)?.[1] || '';
+          const resId = forward.resId || xmlResId;
+          const fetched = await this.fetchForwardRawMessagesForHydration(message, resId);
+          if (fetched.length > 0) {
+            records = fetched;
+            (message as any).records = fetched;
+            hydratedCount++;
+            break;
+          }
+        }
+      }
+
+      for (const record of records) {
+        await walk(record, depth + 1);
+      }
+    };
+
+    for (const message of messages) {
+      await walk(message, 0);
+    }
+    return hydratedCount;
+  }
+
+  private async fetchForwardRawMessagesForHydration(
+    message: RawMessage,
+    resId: string
+  ): Promise<RawMessage[]> {
+    try {
+      const bridge = (globalThis as any).__NAPCAT_BRIDGE__;
+      const core = bridge?.core;
+      const msgApi = core?.apis?.MsgApi || core?.apis?.msg;
+      if (msgApi && typeof msgApi.getMultiMsg === 'function') {
+        const peer = {
+          chatType: message.chatType,
+          peerUid: message.peerUid,
+          guildId: ''
+        };
+        const result = await msgApi.getMultiMsg({
+          peer,
+          rootMsgId: message.msgId,
+          parentMsgId: message.msgId,
+          forwardId: resId,
+          resId
+        });
+        if (result && Array.isArray(result.msgList) && result.msgList.length > 0) {
+          return this.assignForwardResourceKeys(result.msgList.filter(Boolean), message);
+        }
+      }
+    } catch {
+      // 继续尝试 OneBot get_forward_msg。
+    }
+
+    const bridge = (globalThis as any).__NAPCAT_BRIDGE__;
+    const getForwardAction = bridge?.actions?.get?.('get_forward_msg');
+    if (!getForwardAction) return [];
+
+    for (const messageId of [message.msgId, resId].filter(Boolean)) {
+      try {
+        const result = await getForwardAction.handle({ message_id: messageId }, 'plugin', {});
+        const actionMessages = result?.data?.messages;
+        if (Array.isArray(actionMessages) && actionMessages.length > 0) {
+          return this.assignForwardResourceKeys(
+            this.normalizeForwardActionRawMessages(actionMessages, message),
+            message
+          );
+        }
+      } catch {
+        // 继续尝试 resId；两种 id 都失败则保留原有降级行为。
+      }
+    }
+    return [];
+  }
+
+  /**
+   * NapCat 的合并转发节点可能共享同一个 msgId（真实样本中三条节点的
+   * message_id 完全相同，只有 clientSeq / real_seq 不同）。不改原 msgId，
+   * 避免破坏 downloadMedia 的入参；另挂一个仅供 QCE resourceMap 使用的键。
+   */
+  private assignForwardResourceKeys(records: RawMessage[], parent: RawMessage): RawMessage[] {
+    const idCounts = new Map<string, number>();
+    for (const record of records) {
+      const id = String(record?.msgId || '');
+      idCounts.set(id, (idCounts.get(id) || 0) + 1);
+    }
+
+    const used = new Set<string>();
+    records.forEach((record, index) => {
+      const baseId = String(record?.msgId || '');
+      let resourceKey = baseId;
+      if (!baseId || (idCounts.get(baseId) || 0) > 1) {
+        const sequence = String(
+          record?.clientSeq || record?.msgSeq || (record as any)?.realSeq || index + 1
+        );
+        resourceKey = `${baseId || parent.msgId || 'forward'}-${sequence}`;
+      }
+      if (used.has(resourceKey)) resourceKey = `${resourceKey}-${index + 1}`;
+      used.add(resourceKey);
+      (record as any).__qceResourceKey = resourceKey;
+    });
+    return records;
+  }
+
+  private normalizeForwardActionRawMessages(messages: any[], parent: RawMessage): RawMessage[] {
+    return messages
+      .filter(Boolean)
+      .map((item: any, index: number) => {
+        const sender = item.sender || {};
+        const messageId = String(
+          item.message_id || item.real_id || item.message_seq || item.real_seq ||
+          `${parent.msgId || 'forward'}-${index + 1}`
+        );
+        const senderUin = String(item.user_id || sender.user_id || '');
+        const nickname = String(sender.nickname || sender.name || sender.card || senderUin);
+        const card = String(sender.card || '');
+        const segments = Array.isArray(item.message) ? item.message : [];
+        const elements = segments
+          .map((segment: any) => this.oneBotSegmentToRawElement(segment))
+          .filter((element: MessageElement | null): element is MessageElement => !!element);
+
+        return {
+          msgId: messageId,
+          msgSeq: String(item.message_seq || item.real_seq || messageId),
+          clientSeq: String(item.real_seq || item.message_seq || messageId),
+          msgTime: String(item.time || parent.msgTime || 0),
+          msgType: 2,
+          chatType: parent.chatType,
+          peerUid: parent.peerUid,
+          senderUid: senderUin,
+          senderUin,
+          sendNickName: nickname,
+          sendMemberName: card,
+          sendRemarkName: '',
+          recallTime: '0',
+          elements,
+          records: [],
+          parentMsgIdList: [String(parent.msgId || '')].filter(Boolean)
+        } as unknown as RawMessage;
+      });
+  }
+
+  private oneBotSegmentToRawElement(segment: any): MessageElement | null {
+    if (!segment) return null;
+    const type = String(segment.type || '').toLowerCase();
+    const data = segment.data || {};
+    const elementId = String(data.element_id || data.elementId || '');
+
+    if (type === 'text') {
+      return {
+        elementType: 1,
+        elementId,
+        textElement: { content: String(data.text || ''), atType: 0, atUid: '', atNtUid: '' }
+      } as unknown as MessageElement;
+    }
+    if (type === 'at') {
+      const qq = String(data.qq || data.user_id || '');
+      const atAll = qq === 'all';
+      return {
+        elementType: 1,
+        elementId,
+        textElement: {
+          content: atAll ? '@全体成员' : `@${data.name || qq}`,
+          atType: atAll ? 1 : 2,
+          atUid: atAll ? '0' : qq,
+          atNtUid: atAll ? '' : qq
+        }
+      } as unknown as MessageElement;
+    }
+    if (type === 'image') {
+      const fileValue = String(data.file || data.file_name || data.filename || '图片');
+      const fileName = this.fileNameFromOneBotValue(fileValue, '图片.jpg');
+      const md5 = String(data.md5 || fileValue.match(/[a-f0-9]{32}/i)?.[0] || '');
+      return {
+        elementType: 2,
+        elementId,
+        picElement: {
+          fileName,
+          fileSize: String(data.file_size || data.size || 0),
+          picWidth: Number(data.width || 0),
+          picHeight: Number(data.height || 0),
+          md5HexStr: md5,
+          originImageUrl: String(data.url || ''),
+          sourcePath: String(data.path || data.url || '')
+        }
+      } as unknown as MessageElement;
+    }
+    if (type === 'record' || type === 'audio') {
+      const fileValue = String(data.file || data.file_name || data.filename || '语音');
+      return {
+        elementType: 4,
+        elementId,
+        pttElement: {
+          fileName: this.fileNameFromOneBotValue(fileValue, '语音.amr'),
+          fileSize: String(data.file_size || data.size || 0),
+          duration: Number(data.duration || 0),
+          md5HexStr: String(data.md5 || ''),
+          filePath: String(data.path || data.url || '')
+        }
+      } as unknown as MessageElement;
+    }
+    if (type === 'video') {
+      const fileValue = String(data.file || data.file_name || data.filename || '视频');
+      return {
+        elementType: 4,
+        elementId,
+        videoElement: {
+          fileName: this.fileNameFromOneBotValue(fileValue, '视频.mp4'),
+          fileSize: String(data.file_size || data.size || 0),
+          duration: Number(data.duration || 0),
+          md5HexStr: String(data.md5 || ''),
+          fileUuid: String(data.file_id || data.file_uuid || ''),
+          filePath: String(data.path || data.url || '')
+        }
+      } as unknown as MessageElement;
+    }
+    if (type === 'file') {
+      const fileValue = String(data.file || data.file_name || data.name || '文件');
+      return {
+        elementType: 3,
+        elementId,
+        fileElement: {
+          fileName: this.fileNameFromOneBotValue(fileValue, '文件'),
+          fileSize: String(data.file_size || data.size || 0),
+          fileMd5: String(data.md5 || ''),
+          filePath: String(data.path || data.url || '')
+        }
+      } as unknown as MessageElement;
+    }
+    if (type === 'face') {
+      return {
+        elementType: 6,
+        elementId,
+        faceElement: { faceIndex: Number(data.id || 0), faceText: String(data.name || '') }
+      } as unknown as MessageElement;
+    }
+    if (type === 'mface' || type === 'market_face') {
+      return {
+        elementType: 37,
+        elementId,
+        marketFaceElement: {
+          faceName: String(data.summary || data.name || '商城表情'),
+          emojiId: String(data.emoji_id || data.id || ''),
+          emojiPackageId: Number(data.emoji_package_id || 0),
+          key: String(data.key || '')
+        }
+      } as unknown as MessageElement;
+    }
+    if (type === 'json') {
+      return {
+        elementType: 10,
+        elementId,
+        arkElement: { bytesData: String(data.data || data.json || '{}') }
+      } as unknown as MessageElement;
+    }
+    if (type === 'forward') {
+      return {
+        elementType: 16,
+        elementId,
+        multiForwardMsgElement: {
+          resId: String(data.id || data.res_id || data.resId || ''),
+          xmlContent: String(data.content || '')
+        }
+      } as unknown as MessageElement;
+    }
+    return null;
+  }
+
+  private fileNameFromOneBotValue(value: string, fallback: string): string {
+    if (!value) return fallback;
+    try {
+      if (/^https?:\/\//i.test(value)) {
+        const urlPath = new URL(value).pathname;
+        return path.basename(urlPath) || fallback;
+      }
+    } catch {
+      // 非法 URL 按普通文件名处理。
+    }
+    const cleanValue = value.split(/[?#]/, 1)[0] || '';
+    return path.basename(cleanValue.replace(/\\/g, '/')) || fallback;
+  }
+
+  /**
    * 解析消息列表（高并发 + 有序输出）
    */
   async parseMessages(messages: RawMessage[]): Promise<CleanMessage[]> {
@@ -458,6 +771,7 @@ export class SimpleMessageParser {
               this.updateSingleMessageResourcePaths(cleanMessage, resources);
             }
             this.backfillReplyPreviewLocalPathsFromResourceMap(cleanMessage, resourceMap);
+            this.backfillForwardInnerResourcePathsFromResourceMap(cleanMessage, resourceMap);
           }
 
           processed++;
@@ -1285,7 +1599,7 @@ export class SimpleMessageParser {
         }
 
         out.push({
-          id: raw.msgId || '',
+          id: String((raw as any).__qceResourceKey || raw.msgId || ''),
           timestamp: tsMs,
           time: rfc3339FromMillis(tsMs),
           sender: {
@@ -1574,7 +1888,54 @@ export class SimpleMessageParser {
     this.backfillReplyPreviewLocalPaths(messages);
     for (const message of messages) {
       this.backfillReplyPreviewLocalPathsFromResourceMap(message, resourceMap);
+      this.backfillForwardInnerResourcePathsFromResourceMap(message, resourceMap);
     }
+  }
+
+  /**
+   * 合并转发详情的子消息不在顶层 messages 数组中，但 ResourceHandler 会把
+   * message.records 里的资源按子消息 id 写入 resourceMap。这里递归回填路径，
+   * 让离线 HTML 展开卡片后也能显示图片、视频、语音和文件。
+   */
+  private backfillForwardInnerResourcePathsFromResourceMap(
+    message: CleanMessage,
+    resourceMap: Map<string, any[]>
+  ): void {
+    const visitElements = (elements: MessageElementData[]): void => {
+      for (const element of elements) {
+        if (element.type !== 'forward' || !Array.isArray(element.data?.messages)) continue;
+        for (const innerMessage of element.data.messages as ForwardInnerMessage[]) {
+          const innerElements = Array.isArray(innerMessage?.content?.elements)
+            ? innerMessage.content.elements
+            : [];
+          const resources = innerMessage?.id ? (resourceMap.get(String(innerMessage.id)) || []) : [];
+          let resourceIndex = 0;
+
+          for (const innerElement of innerElements) {
+            if (!['image', 'video', 'audio', 'file'].includes(innerElement.type)) continue;
+            const matching = resources.find((resource, index) =>
+              index >= resourceIndex
+              && resource?.type === innerElement.type
+              && resource?.localPath
+              && resource?.accessible !== false
+            );
+            if (!matching) continue;
+            const fileName = path.basename(String(matching.localPath));
+            const typeDir = `${matching.type}s`;
+            innerElement.data = innerElement.data && typeof innerElement.data === 'object'
+              ? innerElement.data
+              : {};
+            innerElement.data.localPath = `${typeDir}/${fileName}`;
+            innerElement.data.url = `resources/${typeDir}/${fileName}`;
+            resourceIndex = resources.indexOf(matching) + 1;
+          }
+
+          visitElements(innerElements);
+        }
+      }
+    };
+
+    visitElements(message.content.elements);
   }
 
   /**

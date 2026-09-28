@@ -468,7 +468,7 @@ export class ResourceHandler {
         for (let cursor = 0; cursor < pending.length; cursor++) {
             const message = pending[cursor];
             if (!message) continue;
-            const key = String(message.msgId || '');
+            const key = String((message as any).__qceResourceKey || message.msgId || '');
             if (key && seenMessageIds.has(key)) continue;
             if (key) seenMessageIds.add(key);
             messagesWithRecords.push(message);
@@ -502,7 +502,8 @@ export class ResourceHandler {
             }
 
             if (resources.length > 0) {
-                resourceMap.set(message.msgId, resources);
+                const resourceKey = String((message as any).__qceResourceKey || message.msgId || '');
+                resourceMap.set(resourceKey, resources);
             }
         }
 
@@ -639,11 +640,20 @@ export class ResourceHandler {
             return resourceInfo;
         }
 
+        // 历史记录里的 originalUrl 有时是 QQNT 本机缓存绝对路径；新的转发
+        // 详情只给临时 CDN URL。只要旧路径仍存在，就优先保留它作为零网络兜底。
+        const cachedLocalSource = typeof cachedResource.originalUrl === 'string'
+            && !/^https?:\/\//i.test(cachedResource.originalUrl)
+            && fs.existsSync(cachedResource.originalUrl)
+            ? cachedResource.originalUrl
+            : '';
+
         return {
             ...cachedResource,
             ...resourceInfo,
             fileSize: resourceInfo.fileSize || cachedResource.fileSize,
             mimeType: resourceInfo.mimeType || cachedResource.mimeType,
+            originalUrl: cachedLocalSource || resourceInfo.originalUrl || cachedResource.originalUrl,
             localPath: cachedResource.localPath || resourceInfo.localPath,
             accessible: cachedResource.accessible,
             checkedAt: cachedResource.checkedAt,
@@ -654,6 +664,66 @@ export class ResourceHandler {
             ),
             lastError: cachedResource.lastError || resourceInfo.lastError
         };
+    }
+
+    private copyExistingLocalSource(
+        element: MessageElement,
+        resourceInfo: ResourceInfo,
+        localPath: string
+    ): string | null {
+        const candidates: unknown[] = [this.getExistingQQImageCachePath(element), resourceInfo.originalUrl];
+        if (element.picElement) candidates.push(element.picElement.sourcePath);
+        if (element.videoElement) candidates.push(element.videoElement.filePath);
+        if (element.pttElement) candidates.push(element.pttElement.filePath);
+        if (element.fileElement) candidates.push(element.fileElement.filePath);
+
+        for (const candidate of candidates) {
+            if (typeof candidate !== 'string' || !candidate.trim() || /^https?:\/\//i.test(candidate)) continue;
+            try {
+                if (!fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) continue;
+                if (path.resolve(candidate) !== path.resolve(localPath)) {
+                    fs.copyFileSync(candidate, localPath);
+                }
+                if (fs.existsSync(localPath) && fs.statSync(localPath).size > 0) {
+                    resourceInfo.originalUrl = candidate;
+                    return localPath;
+                }
+            } catch {
+                // 尝试下一个候选路径。
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 让 QQNT 用图片哈希计算它自己的媒体缓存路径。合并转发节点即使只有
+     * 临时 URL，md5HexStr / fileName 通常仍然完整，因此能复用 QQ 已落盘原图。
+     */
+    private getExistingQQImageCachePath(element: MessageElement): string {
+        if (!element.picElement) return '';
+        try {
+            const bridgeCore = (globalThis as any)?.__NAPCAT_BRIDGE__?.core;
+            const core = bridgeCore || this.core;
+            const msgService = core?.context?.session?.getMsgService?.();
+            const getPath = msgService?.getRichMediaFilePathForGuild;
+            if (typeof getPath !== 'function') return '';
+            const candidate = getPath.call(msgService, {
+                md5HexStr: String(element.picElement.md5HexStr || ''),
+                fileName: String(element.picElement.fileName || ''),
+                elementType: Number(element.elementType || 2),
+                elementSubType: Number((element.picElement as any).picSubType || 0),
+                thumbSize: 0,
+                needCreate: false,
+                downloadType: 1,
+                file_uuid: String((element.picElement as any).fileUuid || '')
+            });
+            if (typeof candidate !== 'string' || !path.isAbsolute(candidate)) return '';
+            return fs.existsSync(candidate) && fs.statSync(candidate).isFile() && fs.statSync(candidate).size > 0
+                ? candidate
+                : '';
+        } catch {
+            return '';
+        }
     }
 
     /**
@@ -1325,6 +1395,69 @@ export class ResourceHandler {
     }
 
     /**
+     * get_forward_msg 返回的是 OneBot 媒体段，通常没有 NapCat 原始 elementId，
+     * downloadMedia 因此无法定位资源；但段内会带本次仍有效的临时 URL。趁导出时
+     * 把它落盘，生成的离线 HTML 就不再依赖会过期的腾讯 CDN 地址。
+     */
+    private async downloadResourceByDirectUrl(
+        element: MessageElement,
+        resourceInfo: ResourceInfo,
+        localPath: string
+    ): Promise<string | null> {
+        const candidates: unknown[] = [];
+        if (element.picElement) {
+            candidates.push(element.picElement.originImageUrl, element.picElement.sourcePath);
+        } else if (element.videoElement) {
+            candidates.push(element.videoElement.filePath, (element.videoElement as any).url);
+        } else if (element.pttElement) {
+            candidates.push(element.pttElement.filePath, (element.pttElement as any).url);
+        } else if (element.fileElement) {
+            candidates.push(element.fileElement.filePath, (element.fileElement as any).url);
+        }
+
+        const directUrl = candidates
+            .map(value => typeof value === 'string' ? value.trim() : '')
+            .find(value => /^https?:\/\//i.test(value));
+        if (!directUrl) return null;
+
+        const partialPath = `${localPath}.partial-${process.pid}-${Date.now()}`;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), this.config.downloadTimeout);
+        try {
+            const response = await fetch(directUrl, {
+                signal: controller.signal,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 QQChatExporter/5',
+                    'Referer': 'https://im.qq.com/'
+                }
+            });
+            if (!response.ok || !response.body) {
+                throw new Error(`媒体URL下载失败: HTTP ${response.status}`);
+            }
+            await pipeline(
+                Readable.fromWeb(response.body as any),
+                fs.createWriteStream(partialPath)
+            );
+            const stats = await fs.promises.stat(partialPath);
+            if (stats.size <= 0) throw new Error('媒体URL下载结果为空');
+
+            await fs.promises.rm(localPath, { force: true });
+            await fs.promises.rename(partialPath, localPath);
+            resourceInfo.originalUrl = directUrl;
+            return localPath;
+        } catch (error) {
+            await fs.promises.rm(partialPath, { force: true }).catch(() => undefined);
+            console.warn(
+                `[ResourceHandler] ${resourceInfo.type} URL回退下载失败:`,
+                error instanceof Error ? error.message : error
+            );
+            return null;
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
+    /**
      * 下载资源
      */
     private async downloadResource(message: RawMessage, element: MessageElement, resourceInfo: ResourceInfo): Promise<string> {
@@ -1335,20 +1468,35 @@ export class ResourceHandler {
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
         }
+
+        const existingLocalSource = this.copyExistingLocalSource(element, resourceInfo, localPath);
+        if (existingLocalSource) return existingLocalSource;
         
         try {
             // 检查是否是图片类型，如果是，使用图片特定的下载方法
             if (element.picElement && resourceInfo.type === 'image') {
-                const downloadedPath = await this.core.apis.FileApi.downloadMedia(
-                    message.msgId,
-                    message.chatType as any,
-                    message.peerUid,
-                    element.elementId,
-                    '', // thumbPath
-                    localPath, // sourcePath  
-                    this.config.downloadTimeout,
-                    true // force
-                );
+                let downloadedPath = '';
+                let downloadError: unknown;
+                try {
+                    downloadedPath = await this.core.apis.FileApi.downloadMedia(
+                        message.msgId,
+                        message.chatType as any,
+                        message.peerUid,
+                        element.elementId,
+                        '', // thumbPath
+                        localPath, // sourcePath
+                        this.config.downloadTimeout,
+                        true // force
+                    );
+                } catch (error) {
+                    downloadError = error;
+                }
+
+                if (!downloadedPath || downloadError) {
+                    const fallbackPath = await this.downloadResourceByDirectUrl(element, resourceInfo, localPath);
+                    if (fallbackPath) return fallbackPath;
+                }
+                if (downloadError) throw downloadError;
                 
                 // 检查下载返回路径是否有效
                 if (!downloadedPath || downloadedPath.trim() === '') {
@@ -1424,6 +1572,10 @@ export class ResourceHandler {
                 // getVideoUrl 仍可返回有效 CDN 地址，优先用它恢复视频文件。
                 if ((!downloadedPath || downloadError) && resourceInfo.type === 'video') {
                     const fallbackPath = await this.downloadVideoByUrl(message, element, resourceInfo, localPath);
+                    if (fallbackPath) return fallbackPath;
+                }
+                if (!downloadedPath || downloadError) {
+                    const fallbackPath = await this.downloadResourceByDirectUrl(element, resourceInfo, localPath);
                     if (fallbackPath) return fallbackPath;
                 }
                 if (downloadError) throw downloadError;

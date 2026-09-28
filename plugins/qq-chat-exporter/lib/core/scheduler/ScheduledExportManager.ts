@@ -703,6 +703,16 @@ export class ScheduledExportManager {
                 message: `正在处理 ${allMessages.length} 条消息中的媒体资源`
             });
 
+            // 合并转发详情需要额外接口才能取得。必须先写回 records，再让资源
+            // 处理器递归扫描，否则详情内媒体只会留下会过期的远程 URL。
+            if (task.format.toUpperCase() === 'HTML') {
+                const forwardHydrator = new SimpleMessageParser({ html: 'none' });
+                const hydratedForwardCount = await forwardHydrator.hydrateForwardRecords(allMessages);
+                if (hydratedForwardCount > 0) {
+                    console.info(`[ScheduledExport] 已预取 ${hydratedForwardCount} 条合并转发详情`);
+                }
+            }
+
             // 下载资源（受 skipDownloadResourceTypes 影响）
             const resourceMap = await this.resourceHandler.processMessageResources(allMessages);
 
