@@ -1283,7 +1283,7 @@ export class ModernHtmlExporter {
                     ${this.escapeHtml(dateLabel)}
                 </div>`;
             }
-            return `<div class="message-block" data-date="${dateKey}">
+            return `<div class="message-block" data-date="${dateKey}" data-message-id="msg-${(message as any).id}">
                 ${dateMarker}
                 <div class="system-message-container" style="text-align: center; margin: 12px 0;">
                     ${content}
@@ -1321,7 +1321,7 @@ export class ModernHtmlExporter {
             ? `<span class="sender-title">${this.escapeHtml(senderTitle)}</span>`
             : '';
         return `
-        <div class="message-block" data-date="${dateKey}">
+        <div class="message-block" data-date="${dateKey}" data-message-id="msg-${(message as any).id}">
             ${dateMarker}
             <div class="message ${cssClass}" data-date="${dateKey}" data-sender-uid="${this.escapeHtml(senderUid)}" id="msg-${(message as any).id}">
                 <div class="avatar">${avatarContent}</div>
