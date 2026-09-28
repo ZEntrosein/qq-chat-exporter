@@ -477,8 +477,14 @@ export class SimpleMessageParser {
     return records;
   }
 
-  private normalizeForwardActionRawMessages(messages: any[], parent: RawMessage): RawMessage[] {
-    return messages
+  private normalizeForwardActionRawMessages(
+    messages: any[],
+    parent: RawMessage,
+    depth: number = 0
+  ): RawMessage[] {
+    if (depth > SimpleMessageParser.MAX_FORWARD_DEPTH) return [];
+
+    return this.normalizeOneBotForwardEntries(messages)
       .filter(Boolean)
       .map((item: any, index: number) => {
         const sender = item.sender || {};
@@ -489,12 +495,12 @@ export class SimpleMessageParser {
         const senderUin = String(item.user_id || sender.user_id || '');
         const nickname = String(sender.nickname || sender.name || sender.card || senderUin);
         const card = String(sender.card || '');
-        const segments = Array.isArray(item.message) ? item.message : [];
+        const segments = this.getOneBotMessageSegments(item);
         const elements = segments
           .map((segment: any) => this.oneBotSegmentToRawElement(segment))
           .filter((element: MessageElement | null): element is MessageElement => !!element);
 
-        return {
+        const raw = {
           msgId: messageId,
           msgSeq: String(item.message_seq || item.real_seq || messageId),
           clientSeq: String(item.real_seq || item.message_seq || messageId),
@@ -512,7 +518,73 @@ export class SimpleMessageParser {
           records: [],
           parentMsgIdList: [String(parent.msgId || '')].filter(Boolean)
         } as unknown as RawMessage;
+
+        // NapCat 在 get_forward_msg 的结果中会把深层聊天记录直接放到
+        // forward.data.content，而不保证这些内层卡片还能再次按 id 拉取。
+        // 这里将内联内容提前还原为 records，避免后续递归解析时丢成空消息。
+        if (depth < SimpleMessageParser.MAX_FORWARD_DEPTH) {
+          const inlineMessages = segments.flatMap((segment: any) =>
+            String(segment?.type || '').toLowerCase() === 'forward'
+              ? this.getOneBotForwardContentEntries(segment?.data?.content)
+              : []
+          );
+          if (inlineMessages.length > 0) {
+            raw.records = this.normalizeForwardActionRawMessages(inlineMessages, raw, depth + 1);
+          }
+        }
+
+        return raw;
       });
+  }
+
+  /**
+   * 兼容 get_forward_msg 的两种子消息形态：
+   * 1) NapCat 当前返回的完整 OneBot 消息（message: MessageSegment[]）
+   * 2) node 包装（data.content: MessageSegment[]）
+   */
+  private normalizeOneBotForwardEntries(entries: any[]): any[] {
+    if (!Array.isArray(entries)) return [];
+    return entries.map((entry: any, index: number) => {
+      if (String(entry?.type || '').toLowerCase() !== 'node' || !Array.isArray(entry?.data?.content)) {
+        return entry;
+      }
+      const data = entry.data || {};
+      const userId = data.user_id ?? data.uin ?? '';
+      return {
+        message_id: data.id ?? data.message_id ?? `forward-node-${index + 1}`,
+        message_seq: data.message_seq ?? data.seq ?? index + 1,
+        real_seq: data.real_seq ?? data.seq ?? index + 1,
+        time: data.time ?? 0,
+        user_id: userId,
+        sender: {
+          user_id: userId,
+          nickname: data.nickname ?? data.name ?? String(userId),
+          card: data.card ?? ''
+        },
+        message: data.content,
+        raw_message: data.raw_message ?? ''
+      };
+    });
+  }
+
+  private getOneBotMessageSegments(item: any): any[] {
+    if (Array.isArray(item?.message)) return item.message;
+    if (String(item?.type || '').toLowerCase() === 'node' && Array.isArray(item?.data?.content)) {
+      return item.data.content;
+    }
+    return [];
+  }
+
+  private getOneBotForwardContentEntries(content: unknown): any[] {
+    if (!Array.isArray(content) || content.length === 0) return [];
+    const normalized = this.normalizeOneBotForwardEntries(content);
+    const looksLikeBareSegments = normalized.every((entry: any) =>
+      typeof entry?.type === 'string'
+      && entry?.data != null
+      && !Array.isArray(entry?.message)
+      && String(entry.type).toLowerCase() !== 'node'
+    );
+    return looksLikeBareSegments ? [{ message: normalized }] : normalized;
   }
 
   private oneBotSegmentToRawElement(segment: any): MessageElement | null {
@@ -1570,7 +1642,7 @@ export class SimpleMessageParser {
     }
 
     if (raws.length === 0) {
-      const fromAction = await this.fetchForwardInnerMessagesByAction(message, resId);
+      const fromAction = await this.fetchForwardInnerMessagesByAction(message, resId, depth);
       if (fromAction.length > 0) {
         return fromAction;
       }
@@ -1621,7 +1693,8 @@ export class SimpleMessageParser {
 
   private async fetchForwardInnerMessagesByAction(
     message: RawMessage,
-    resId: string
+    resId: string,
+    depth: number
   ): Promise<ForwardInnerMessage[]> {
     const bridge = (globalThis as any).__NAPCAT_BRIDGE__;
     const getForwardAction = bridge?.actions?.get?.('get_forward_msg');
@@ -1632,7 +1705,7 @@ export class SimpleMessageParser {
         const result = await getForwardAction.handle({ message_id: messageId }, 'plugin', {});
         const messages = result?.data?.messages;
         if (Array.isArray(messages) && messages.length > 0) {
-          return this.normalizeForwardActionMessages(messages);
+          return this.normalizeForwardActionMessages(messages, depth);
         }
       } catch {
         // 继续尝试下一个 messageId / resId。
@@ -1641,17 +1714,40 @@ export class SimpleMessageParser {
     return [];
   }
 
-  private normalizeForwardActionMessages(messages: any[]): ForwardInnerMessage[] {
+  private normalizeForwardActionMessages(
+    messages: any[],
+    depth: number = 0
+  ): ForwardInnerMessage[] {
+    if (depth > SimpleMessageParser.MAX_FORWARD_DEPTH) return [];
+
     const out: ForwardInnerMessage[] = [];
-    for (const item of messages) {
+    for (const item of this.normalizeOneBotForwardEntries(messages)) {
       if (!item) continue;
       const sender = item.sender || {};
-      const elements = Array.isArray(item.message)
-        ? item.message.map((element: any) => ({
-            type: String(element?.type || 'unknown'),
-            data: element?.data || {}
-          }))
-        : [];
+      const elements = this.getOneBotMessageSegments(item).map((element: any) => {
+        const type = String(element?.type || 'unknown').toLowerCase();
+        const data = element?.data || {};
+        if (type !== 'forward') return { type, data };
+
+        const contentEntries = this.getOneBotForwardContentEntries(data.content);
+        const innerMessages = depth < SimpleMessageParser.MAX_FORWARD_DEPTH
+          ? this.normalizeForwardActionMessages(contentEntries, depth + 1)
+          : [];
+        const explicitCount = Number(data.message_count ?? data.messageCount);
+        return {
+          type: 'forward',
+          data: {
+            ...data,
+            title: data.title || '聊天记录',
+            resId: String(data.id || data.res_id || data.resId || ''),
+            summary: data.summary || (innerMessages.length > 0
+              ? `查看${innerMessages.length}条转发消息`
+              : '查看转发消息'),
+            messageCount: Number.isFinite(explicitCount) ? explicitCount : innerMessages.length,
+            messages: innerMessages
+          }
+        };
+      });
       const textFromElements = elements
         .map((element) => this.elementToText(element, false).text)
         .filter(Boolean)
