@@ -857,7 +857,18 @@ export class ResourceHandler {
         resourceInfo: ResourceInfo,
         control?: ResourceProcessingControl
     ): Promise<void> {
-        const taskId = `${message.msgId}_${element.elementId}`;
+        // 合并转发的不同层级可能复用同一个 msgId，OneBot 还可能不给 elementId。
+        // 使用解析器生成的层级资源键，并补充资源自身身份，避免深层媒体被队列
+        // 误判为外层媒体而直接跳过。
+        const messageKey = String((message as any).__qceResourceKey || message.msgId || 'message');
+        const elementKey = String(
+            element.elementId
+            || resourceInfo.md5
+            || resourceInfo.fileName
+            || resourceInfo.localPath
+            || 'resource'
+        );
+        const taskId = `${messageKey}_${elementKey}`;
         
         // 检查是否已在队列中
         if (this.downloadQueue.some(task => task.id === taskId)) {
@@ -1376,15 +1387,16 @@ export class ResourceHandler {
             : (bridgeFileApi || exposedFileApi);
         if (!fileApi) return null;
 
+        const context = this.getEffectiveDownloadContext(message);
         let videoUrl = '';
         if (typeof fileApi.getVideoUrl === 'function') {
             const peer = {
-                chatType: message.chatType,
-                peerUid: message.peerUid,
-                guildId: '0'
+                chatType: context.chatType,
+                peerUid: context.peerUid,
+                guildId: context.guildId || '0'
             };
             const parentMessageIds = (((message as any).parentMsgIdList || []) as unknown[]).map(String);
-            const messageIds = [String(message.msgId), ...parentMessageIds]
+            const messageIds = [String(message.msgId), context.rootMsgId, ...parentMessageIds]
                 .filter((id, index, values) => id && values.indexOf(id) === index);
             for (const sourceMessageId of messageIds) {
                 try {
@@ -1401,7 +1413,7 @@ export class ResourceHandler {
         if (!videoUrl && typeof fileApi.getVideoUrlPacket === 'function' && (element.videoElement as any).fileUuid) {
             try {
                 videoUrl = await fileApi.getVideoUrlPacket(
-                    message.peerUid,
+                    context.peerUid,
                     (element.videoElement as any).fileUuid,
                     1500
                 ) || '';
@@ -1463,6 +1475,7 @@ export class ResourceHandler {
      * 把它落盘，生成的离线 HTML 就不再依赖会过期的腾讯 CDN 地址。
      */
     private async downloadResourceByDirectUrl(
+        message: RawMessage,
         element: MessageElement,
         resourceInfo: ResourceInfo,
         localPath: string
@@ -1476,6 +1489,32 @@ export class ResourceHandler {
             candidates.push(element.pttElement.filePath, (element.pttElement as any).url);
         } else if (element.fileElement) {
             candidates.push(element.fileElement.filePath, (element.fileElement as any).url);
+        }
+
+        // 原生 getMultiMsg 返回的深层图片经常只有 `/download?...`，而不是可直接
+        // 请求的完整 URL；让 NapCat 根据 fileid/md5 补上当前有效的 rkey。语音同理，
+        // 优先通过 fileUuid 获取临时地址。公开 overlay 不一定暴露这些方法，因此
+        // 优先使用 bridge 中的完整 FileApi。
+        const exposedFileApi = (this.core as any)?.apis?.FileApi || (this.core as any)?.apis?.file;
+        const bridgeFileApi = (globalThis as any)?.__NAPCAT_BRIDGE__?.core?.apis?.FileApi
+            || (globalThis as any)?.__NAPCAT_BRIDGE__?.core?.apis?.file;
+        const fileApi = bridgeFileApi || exposedFileApi;
+        if (element.picElement && typeof fileApi?.getImageUrl === 'function') {
+            try {
+                candidates.unshift(await fileApi.getImageUrl(element.picElement));
+            } catch (error) {
+                console.warn('[ResourceHandler] getImageUrl 获取图片地址失败:', error instanceof Error ? error.message : error);
+            }
+        } else if (element.pttElement && typeof fileApi?.getPttUrl === 'function') {
+            const fileUuid = String((element.pttElement as any).fileUuid || '');
+            if (fileUuid) {
+                try {
+                    const context = this.getEffectiveDownloadContext(message);
+                    candidates.unshift(await fileApi.getPttUrl(context.peerUid, fileUuid, 1500));
+                } catch (error) {
+                    console.warn('[ResourceHandler] getPttUrl 获取语音地址失败:', error instanceof Error ? error.message : error);
+                }
+            }
         }
 
         const directUrl = candidates
@@ -1525,6 +1564,7 @@ export class ResourceHandler {
      */
     private async downloadResource(message: RawMessage, element: MessageElement, resourceInfo: ResourceInfo): Promise<string> {
         const localPath = resourceInfo.localPath || this.generateLocalPath(resourceInfo);
+        const context = this.getEffectiveDownloadContext(message);
         
         // 确保目录存在
         const dir = path.dirname(localPath);
@@ -1534,6 +1574,20 @@ export class ResourceHandler {
 
         const existingLocalSource = this.copyExistingLocalSource(element, resourceInfo, localPath);
         if (existingLocalSource) return existingLocalSource;
+
+        // 深层合并转发媒体不是普通会话消息，downloadRichMedia 往往会一直等到
+        // timeout 后才报告“找不到”。图片/语音已有可独立取址的 fileid/fileUuid，
+        // 因此在明确属于转发详情时先走带 rkey 的 URL，避免每两张图片额外等待
+        // 一个 30 秒超时；取址失败仍会继续执行下方旧流程。
+        const isForwardRecord = !!(
+            (message as any).__qceForwardPeer
+            || (message as any).parentMsgPeer
+            || (Array.isArray((message as any).parentMsgIdList) && (message as any).parentMsgIdList.length > 0)
+        );
+        if (isForwardRecord && (element.picElement || element.pttElement)) {
+            const directPath = await this.downloadResourceByDirectUrl(message, element, resourceInfo, localPath);
+            if (directPath) return directPath;
+        }
         
         try {
             // 检查是否是图片类型，如果是，使用图片特定的下载方法
@@ -1543,8 +1597,8 @@ export class ResourceHandler {
                 try {
                     downloadedPath = await this.core.apis.FileApi.downloadMedia(
                         message.msgId,
-                        message.chatType as any,
-                        message.peerUid,
+                        context.chatType as any,
+                        context.peerUid,
                         element.elementId,
                         '', // thumbPath
                         localPath, // sourcePath
@@ -1556,7 +1610,7 @@ export class ResourceHandler {
                 }
 
                 if (!downloadedPath || downloadError) {
-                    const fallbackPath = await this.downloadResourceByDirectUrl(element, resourceInfo, localPath);
+                    const fallbackPath = await this.downloadResourceByDirectUrl(message, element, resourceInfo, localPath);
                     if (fallbackPath) return fallbackPath;
                 }
                 if (downloadError) throw downloadError;
@@ -1619,8 +1673,8 @@ export class ResourceHandler {
                 try {
                     downloadedPath = await this.core.apis.FileApi.downloadMedia(
                         message.msgId,
-                        message.chatType as any,
-                        message.peerUid,
+                        context.chatType as any,
+                        context.peerUid,
                         element.elementId,
                         '', // thumbPath
                         localPath, // sourcePath
@@ -1638,7 +1692,7 @@ export class ResourceHandler {
                     if (fallbackPath) return fallbackPath;
                 }
                 if (!downloadedPath || downloadError) {
-                    const fallbackPath = await this.downloadResourceByDirectUrl(element, resourceInfo, localPath);
+                    const fallbackPath = await this.downloadResourceByDirectUrl(message, element, resourceInfo, localPath);
                     if (fallbackPath) return fallbackPath;
                 }
                 if (downloadError) throw downloadError;
@@ -1725,14 +1779,52 @@ export class ResourceHandler {
                     resourceType: resourceInfo.type,
                     fileName: resourceInfo.fileName,
                     localPath,
-                    chatType: message.chatType,
-                    peerUid: message.peerUid,
+                    chatType: context.chatType,
+                    peerUid: context.peerUid,
                     timeout: this.config.downloadTimeout,
                     error: errorMessage
                 },
                 timestamp: new Date()
             });
         }
+    }
+
+    /**
+     * 合并转发详情里的 RawMessage 往往没有自己的 peerUid/chatType；它实际仍属于
+     * 最外层聊天。SimpleMessageParser 在拉取详情时把该上下文保存在内部字段中，
+     * 资源下载阶段必须优先使用它，否则 QQNT 无法定位深层媒体。
+     */
+    private getEffectiveDownloadContext(message: RawMessage): {
+        chatType: number;
+        peerUid: string;
+        guildId: string;
+        rootMsgId: string;
+    } {
+        const internalPeer = (message as any).__qceForwardPeer;
+        const parentPeer = (message as any).parentMsgPeer;
+        const firstString = (...values: unknown[]): string => {
+            for (const value of values) {
+                const text = value == null ? '' : String(value);
+                if (text && text !== '0') return text;
+            }
+            return '';
+        };
+        const firstNumber = (...values: unknown[]): number => {
+            for (const value of values) {
+                const number = Number(value);
+                if (Number.isFinite(number) && number > 0) return number;
+            }
+            return 0;
+        };
+        const parentIds = Array.isArray((message as any).parentMsgIdList)
+            ? (message as any).parentMsgIdList
+            : [];
+        return {
+            chatType: firstNumber(internalPeer?.chatType, parentPeer?.chatType, message.chatType),
+            peerUid: firstString(internalPeer?.peerUid, parentPeer?.peerUid, message.peerUid),
+            guildId: firstString(internalPeer?.guildId, parentPeer?.guildId, (message as any).guildId),
+            rootMsgId: firstString((message as any).__qceForwardRootMsgId, parentIds[0], message.msgId),
+        };
     }
 
     /**

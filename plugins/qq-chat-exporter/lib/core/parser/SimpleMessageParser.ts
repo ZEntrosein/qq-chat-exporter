@@ -417,8 +417,9 @@ export class SimpleMessageParser {
         const result = await getForwardAction.handle({ message_id: messageId }, 'plugin', {});
         const actionMessages = result?.data?.messages;
         if (Array.isArray(actionMessages) && actionMessages.length > 0) {
+          const normalized = this.normalizeForwardActionRawMessages(actionMessages, message);
           return this.assignForwardResourceKeys(
-            this.normalizeForwardActionRawMessages(actionMessages, message),
+            this.attachForwardFetchContext(normalized, message),
             message
           );
         }
@@ -516,6 +517,10 @@ export class SimpleMessageParser {
    * 避免破坏 downloadMedia 的入参；另挂一个仅供 QCE resourceMap 使用的键。
    */
   private assignForwardResourceKeys(records: RawMessage[], parent: RawMessage): RawMessage[] {
+    // 外层节点沿用原来的短键，避免无谓改变已导出 JSON；从第二层开始把父键
+    // 纳入命名空间。NapCat 的不同层级经常重复使用同一个 msgId / clientSeq，
+    // 如果只在同级去重，ResourceHandler 的递归扫描会把深层节点误认为已处理。
+    const parentResourceKey = String((parent as any).__qceResourceKey || '');
     const idCounts = new Map<string, number>();
     for (const record of records) {
       const id = String(record?.msgId || '');
@@ -532,6 +537,7 @@ export class SimpleMessageParser {
         );
         resourceKey = `${baseId || parent.msgId || 'forward'}-${sequence}`;
       }
+      if (parentResourceKey) resourceKey = `${parentResourceKey}/${resourceKey || index + 1}`;
       if (used.has(resourceKey)) resourceKey = `${resourceKey}-${index + 1}`;
       used.add(resourceKey);
       (record as any).__qceResourceKey = resourceKey;

@@ -357,6 +357,7 @@ test('hydrateForwardRecords: 在资源扫描前把 get_forward_msg 子消息转�
         assert.equal(picture.md5HexStr, '0123456789abcdef0123456789abcdef');
         assert.equal(picture.originImageUrl, 'https://multimedia.nt.qq.com.cn/download?appid=1407');
         assert.equal(picture.sourcePath, 'https://multimedia.nt.qq.com.cn/download?appid=1407');
+        assert.equal((top.records[0] as any).__qceForwardPeer.peerUid, top.peerUid);
     } finally {
         if (previousBridge === undefined) {
             delete (globalThis as any).__NAPCAT_BRIDGE__;
@@ -641,4 +642,15 @@ test('hydrateForwardRecords: 相同的转发节点 msgId 使用序号生成独�
             (globalThis as any).__NAPCAT_BRIDGE__ = previousBridge;
         }
     }
+});
+
+test('深层转发资源键包含父层命名空间，避免跨层 msgId 冲突', () => {
+    const parser = new SimpleMessageParser({ html: 'none' }) as any;
+    const parent = rawMessage({ msgId: 'shared-id' }) as any;
+    parent.__qceResourceKey = 'shared-id-53767';
+    const child = rawMessage({ msgId: 'shared-id', clientSeq: '53767' });
+
+    const [assigned] = parser.assignForwardResourceKeys([child], parent);
+
+    assert.equal(assigned.__qceResourceKey, 'shared-id-53767/shared-id');
 });
