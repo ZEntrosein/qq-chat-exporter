@@ -1819,6 +1819,27 @@ export class ModernHtmlExporter {
             .replace(/\[图片:(?:[a-f0-9]{32})(?:\.[a-z0-9]+)?\]/gi, '[图片]');
     }
 
+    private renderForwardMessageAvatar(sender: any): string {
+        const name = String(sender?.name || sender?.uin || sender?.uid || '未知').trim() || '未知';
+        const firstCharacter = Array.from(name)[0] || 'U';
+        const rawExplicitUrl = typeof sender?.avatarUrl === 'string' ? sender.avatarUrl.trim() : '';
+        const explicitUrl = /^(?:https?:\/\/|data:image\/)/i.test(rawExplicitUrl) ? rawExplicitUrl : '';
+        const numericId = [sender?.uin, sender?.uid]
+            .map((value) => String(value || '').trim())
+            .find((value) => /^\d{5,14}$/.test(value));
+        const avatarUrl = explicitUrl || (numericId
+            ? `https://q1.qlogo.cn/g?b=qq&nk=${numericId}&s=100`
+            : '');
+        const fallback = `<span class="forward-message-avatar-fallback"${avatarUrl ? '' : ' style="display:inline-flex"'}>${this.escapeHtml(firstCharacter)}</span>`;
+        if (!avatarUrl) {
+            return `<div class="forward-message-avatar" aria-label="${this.escapeHtml(name)}的头像">${fallback}</div>`;
+        }
+        return `<div class="forward-message-avatar" aria-label="${this.escapeHtml(name)}的头像">
+                <img src="${this.escapeHtml(avatarUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.style.display='none';this.nextElementSibling.style.display='inline-flex'">
+                ${fallback}
+            </div>`;
+    }
+
     private renderForwardElement(data: any, depth: number = 0): string {
         const title = data?.title || '聊天记录';
         const rawSummary = typeof data?.summary === 'string' ? data.summary : (typeof data?.content === 'string' ? data.content : '');
@@ -1830,7 +1851,7 @@ export class ModernHtmlExporter {
         // issue #161：解析器现在会把合并转发消息卡片里的真实子消息塞进 data.messages，
         // 优先用它渲染完整列表，老数据 / fallback 再退回 preview / summary。
         const innerMessages: Array<{
-            sender?: { name?: string; uin?: string };
+            sender?: { name?: string; uin?: string; uid?: string; avatarUrl?: string };
             content?: { text?: string; elements?: Array<{ type?: string; data?: any }> };
         }> = Array.isArray(data?.messages) ? data.messages : [];
         const messageCount: number = typeof data?.messageCount === 'number' ? data.messageCount : innerMessages.length;
@@ -1877,11 +1898,14 @@ export class ModernHtmlExporter {
             const time = this.formatTime(message?.time || message?.timestamp);
             const content = this.renderForwardInnerContent(message, depth);
             return `<div class="forward-message-item">
-                <div class="forward-message-meta">
-                    <span class="forward-message-sender">${this.escapeHtml(senderName)}</span>
-                    ${time ? `<time class="forward-message-time">${this.escapeHtml(time)}</time>` : ''}
+                ${this.renderForwardMessageAvatar(message?.sender)}
+                <div class="forward-message-main">
+                    <div class="forward-message-meta">
+                        <span class="forward-message-sender">${this.escapeHtml(senderName)}</span>
+                        ${time ? `<time class="forward-message-time">${this.escapeHtml(time)}</time>` : ''}
+                    </div>
+                    <div class="forward-message-content">${content}</div>
                 </div>
-                <div class="forward-message-content">${content}</div>
             </div>`;
         }).join('');
 

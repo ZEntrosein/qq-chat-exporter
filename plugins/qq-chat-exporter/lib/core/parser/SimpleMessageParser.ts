@@ -242,11 +242,24 @@ export interface ForwardInnerMessage {
     uid?: string;
     uin?: string;
     name: string;
+    /** 子消息发送者头像；原数据未携带时按 QQ 号生成 qlogo 地址。 */
+    avatarUrl?: string;
   };
   content: {
     text: string;
     elements: MessageElementData[];
   };
+}
+
+interface ForwardPacketIdentity {
+  index: number;
+  used: boolean;
+  msgId: string;
+  seq: string;
+  uid: string;
+  uin: string;
+  name: string;
+  avatarUrl: string;
 }
 
 export interface ResourceData {
@@ -326,6 +339,10 @@ export class SimpleMessageParser {
   private messageBySeq: Map<string, RawMessage> = new Map();
   private messageByClientSeq: Map<string, RawMessage> = new Map();
 
+  // 某些合并转发来源仍会提供可转换的 senderUid；转换并缓存，避免重复请求。
+  // 收到的匿名转发节点则优先使用协议自带的签名头像 URL，不走这条链路。
+  private forwardSenderUinCache: Map<string, Promise<string>> = new Map();
+
   // 发件人显示信息缓存：senderUid / senderUin → { groupCard, remark, nickname }
   // 用于在某条消息缺失全部昵称字段时，回退到同一发件人在其他消息上出现过的可读名字。
   private senderInfoCache: Map<string, {
@@ -370,6 +387,9 @@ export class SimpleMessageParser {
         : [];
 
       if (records.length > 0 && forwardElements.length > 0) {
+        const forward = forwardElements[0]?.multiForwardMsgElement;
+        const xmlResId = (forward?.xmlContent || '').match(/m_resid="([^"]+)"/)?.[1] || '';
+        await this.restoreForwardSenderIdentities(records, forward?.resId || xmlResId);
         records = this.attachForwardFetchContext(records, message);
         records = this.assignForwardResourceKeys(records, message);
         (message as any).records = records;
@@ -706,6 +726,7 @@ export class SimpleMessageParser {
         const actionMessages = result?.data?.messages;
         if (Array.isArray(actionMessages) && actionMessages.length > 0) {
           const normalized = this.normalizeForwardActionRawMessages(actionMessages, message);
+          await this.restoreForwardSenderIdentities(normalized, resId);
           return this.assignForwardResourceKeys(
             this.attachForwardFetchContext(normalized, message),
             message
@@ -761,7 +782,109 @@ export class SimpleMessageParser {
     }
 
     if (!Array.isArray(result?.msgList) || result.msgList.length === 0) return [];
-    return this.attachForwardFetchContext(result.msgList.filter(Boolean), message);
+    const messages = result.msgList.filter(Boolean);
+    await this.restoreForwardSenderIdentities(messages, resId);
+    return this.attachForwardFetchContext(messages, message);
+  }
+
+  /**
+   * getMultiMsg / get_forward_msg 在部分 NapCat 版本里会把制作者账号的
+   * UIN/UID 填进所有合并转发子节点。原始长消息资源不会暴露真实账号，
+   * 但会在 contentHead.forward 中保留 QQ 客户端实际使用的签名头像 URL。
+   * 这里按消息 ID、序号或稳定顺序回填头像；正文和媒体仍走原解析链路。
+   */
+  private async restoreForwardSenderIdentities(
+    records: RawMessage[],
+    resId: string
+  ): Promise<void> {
+    if (!records.length || !resId) return;
+    const bridge = (globalThis as any).__NAPCAT_BRIDGE__;
+    const operation = bridge?.core?.apis?.PacketApi?.pkt?.operation;
+    if (typeof operation?.FetchForwardMsgRaw !== 'function') return;
+
+    let actions: any[];
+    try {
+      const result = await operation.FetchForwardMsgRaw(resId);
+      actions = Array.isArray(result) ? result : [];
+    } catch {
+      return;
+    }
+
+    const main = actions.find(action => String(action?.actionCommand || '') === 'MultiMsg');
+    const packetMessages = Array.isArray(main?.actionData?.msgBody)
+      ? main.actionData.msgBody
+      : [];
+    if (!packetMessages.length) return;
+
+    const identities: ForwardPacketIdentity[] = packetMessages.map((packet: any, index: number) => {
+      const response = packet?.responseHead || {};
+      const content = packet?.contentHead || {};
+      const uin = String(response?.fromUin ?? '').trim();
+      const avatarCandidate = String(
+        content?.forward?.unknownBase64
+        ?? content?.forward?.avatarUrl
+        ?? response?.forward?.avatarUrl
+        ?? ''
+      ).trim();
+      return {
+        index,
+        used: false,
+        msgId: String(content?.newId ?? content?.msgId ?? '').trim(),
+        seq: String(content?.sequence ?? content?.msgSeq ?? '').trim(),
+        uid: String(response?.fromUid ?? '').trim(),
+        uin: /^\d{5,14}$/.test(uin) ? uin : '',
+        name: String(
+          response?.grp?.memberName
+          ?? response?.forward?.friendName
+          ?? response?.friendName
+          ?? ''
+        ).trim(),
+        avatarUrl: /^https?:\/\//i.test(avatarCandidate) ? avatarCandidate : ''
+      };
+    }).filter((identity: ForwardPacketIdentity) =>
+      identity.uid || identity.uin || identity.name || identity.avatarUrl
+    );
+    if (!identities.length) return;
+
+    records.forEach((record, recordIndex) => {
+      const recordId = String(record?.msgId || '').trim();
+      const recordSeqs = [record?.msgSeq, record?.clientSeq, (record as any)?.realSeq]
+        .map(value => String(value ?? '').trim())
+        .filter(Boolean);
+
+      let best: typeof identities[number] | undefined;
+      let bestScore = 0;
+      for (const identity of identities) {
+        if (identity.used) continue;
+        const idMatches = !!recordId && !!identity.msgId && recordId === identity.msgId;
+        const seqMatches = !!identity.seq && recordSeqs.includes(identity.seq);
+        const score = (idMatches ? 4 : 0) + (seqMatches ? 8 : 0);
+        if (score > bestScore) {
+          best = identity;
+          bestScore = score;
+        }
+      }
+      if (!best && identities.length === records.length) {
+        const sameIndex = identities.find((identity: ForwardPacketIdentity) =>
+          identity.index === recordIndex && !identity.used
+        );
+        if (sameIndex) best = sameIndex;
+      }
+      if (!best) return;
+
+      best.used = true;
+      // QQ 收到的合并转发会把 fromUin/fromUid 匿名替换成制作者账号，
+      // 不能据此生成头像或暴露为真实发送者 ID。真正用于头像展示的是
+      // contentHead.forward.unknownBase64 中的带签名 qlogo 地址。
+      if (best.avatarUrl) {
+        (record as any).avatarUrl = best.avatarUrl;
+        (record as any).__qceForwardProtocolAvatar = true;
+      }
+      if (best.name) {
+        (record as any).sendNickName = best.name;
+        (record as any).sendMemberName = best.name;
+      }
+    });
   }
 
   private getForwardFetchContext(message: RawMessage): {
@@ -2026,6 +2149,12 @@ export class SimpleMessageParser {
         const tsMs = millisFromUnixSeconds(raw.msgTime as any);
         this.cacheSenderInfo(raw);
         const senderInfo = this.getSenderDisplayInfo(raw);
+        // 协议头像存在时，QQ 同时返回的 fromUin/fromUid 是匿名占位身份，
+        // 不把它序列化成该节点发送者的真实账号。
+        const senderUid = (raw as any).__qceForwardProtocolAvatar
+          ? ''
+          : String(raw.senderUid || '').trim();
+        const senderUin = await this.resolveNativeForwardSenderUin(raw, senderUid);
 
         const elementsArr: MessageElementData[] = [];
         const textParts: string[] = [];
@@ -2044,9 +2173,16 @@ export class SimpleMessageParser {
           timestamp: tsMs,
           time: rfc3339FromMillis(tsMs),
           sender: {
-            uid: raw.senderUid || undefined,
-            uin: raw.senderUin || undefined,
-            name: senderInfo.name
+            uid: senderUid || undefined,
+            uin: senderUin || undefined,
+            name: senderInfo.name,
+            avatarUrl: this.resolveForwardAvatarUrl([
+              (raw as any).avatarUrl,
+              (raw as any).avatar,
+              (raw as any).senderAvatar,
+              (raw as any).sender?.avatarUrl,
+              (raw as any).sender?.avatar
+            ], senderUin, senderUid)
           },
           content: {
             text: textParts.join(''),
@@ -2129,15 +2265,27 @@ export class SimpleMessageParser {
       const text = textFromElements || rawText;
       const tsMs = millisFromUnixSeconds(item.time || 0);
       const senderName = sender.card || sender.nickname || sender.name || String(item.user_id || sender.user_id || '');
+      const senderUid = String(
+        sender.user_uid ?? sender.uid ?? item.user_uid ?? item.uid ?? item.user_id ?? ''
+      ).trim();
+      const senderUin = String(sender.user_id ?? sender.uin ?? item.user_id ?? item.uin ?? '').trim();
 
       out.push({
         id: String(item.message_id || item.real_id || item.message_seq || item.real_seq || ''),
         timestamp: tsMs,
         time: rfc3339FromMillis(tsMs),
         sender: {
-          uid: item.user_id != null ? String(item.user_id) : undefined,
-          uin: sender.user_id != null ? String(sender.user_id) : undefined,
-          name: senderName
+          uid: senderUid || undefined,
+          uin: senderUin || undefined,
+          name: senderName,
+          avatarUrl: this.resolveForwardAvatarUrl([
+            sender.avatarUrl,
+            sender.avatar_url,
+            sender.avatar,
+            item.avatarUrl,
+            item.avatar_url,
+            item.avatar
+          ], senderUin, senderUid)
         },
         content: {
           text,
@@ -2146,6 +2294,56 @@ export class SimpleMessageParser {
       });
     }
     return out;
+  }
+
+  /**
+   * 优先保留 NapCat / OneBot 给出的头像地址；没有时只对纯数字 QQ 号
+   * 生成 qlogo URL。`u_xxx` 形式的 UID 不能直接用于 qlogo，留给 HTML
+   * 用姓名首字作离线兜底。
+   */
+  private resolveForwardAvatarUrl(
+    explicitCandidates: unknown[],
+    senderUin?: string,
+    senderUid?: string
+  ): string | undefined {
+    for (const candidate of explicitCandidates) {
+      if (typeof candidate !== 'string') continue;
+      const url = candidate.trim();
+      if (/^https?:\/\//i.test(url) || /^data:image\//i.test(url)) return url;
+    }
+    const numericId = [senderUin, senderUid]
+      .map(value => String(value || '').trim())
+      .find(value => /^\d{5,14}$/.test(value));
+    return numericId
+      ? `https://q1.qlogo.cn/g?b=qq&nk=${numericId}&s=100`
+      : undefined;
+  }
+
+  private async resolveNativeForwardSenderUin(raw: RawMessage, senderUid: string): Promise<string> {
+    const rawUin = String(raw.senderUin || (raw as any).senderUinStr || '').trim();
+    if (/^\d{5,14}$/.test(senderUid)) return senderUid;
+    if (!senderUid) return '';
+
+    let pending = this.forwardSenderUinCache.get(senderUid);
+    if (!pending) {
+      pending = (async () => {
+        const bridge = (globalThis as any).__NAPCAT_BRIDGE__;
+        const userApi = bridge?.core?.apis?.UserApi || bridge?.core?.apis?.user;
+        const converter = userApi?.getUinByUidV2;
+        if (typeof converter !== 'function') return '';
+        try {
+          const converted = String(await converter.call(userApi, senderUid) || '').trim();
+          return /^\d{5,14}$/.test(converted) ? converted : '';
+        } catch {
+          return '';
+        }
+      })();
+      this.forwardSenderUinCache.set(senderUid, pending);
+    }
+
+    // senderUid 存在时，rawUin 在真实样本中已证实可能是外层发送者。
+    // 转换失败就返回空，让 HTML 用名字首字兜底，不冒用错误头像。
+    return await pending;
   }
 
   private isSystemMessage(message: RawMessage): boolean {

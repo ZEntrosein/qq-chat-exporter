@@ -1237,6 +1237,9 @@ export const MODERN_CSS = `
         .forward-message-item {
             padding: 12px 0;
             border-bottom: 1px solid rgba(0, 0, 0, 0.07);
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
         }
 
         .forward-message-item:last-child {
@@ -1245,6 +1248,40 @@ export const MODERN_CSS = `
 
         [data-theme="dark"] .forward-message-item {
             border-bottom-color: rgba(255, 255, 255, 0.09);
+        }
+
+        .forward-message-avatar {
+            width: 32px;
+            height: 32px;
+            flex: 0 0 32px;
+            border-radius: 50%;
+            overflow: hidden;
+            background: linear-gradient(135deg, #5b8ff9, #7b61ff);
+            box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.05);
+        }
+
+        .forward-message-avatar img {
+            display: block;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        .forward-message-avatar-fallback {
+            display: none;
+            width: 100%;
+            height: 100%;
+            align-items: center;
+            justify-content: center;
+            color: #fff;
+            font-size: 13px;
+            font-weight: 600;
+            line-height: 1;
+        }
+
+        .forward-message-main {
+            flex: 1 1 auto;
+            min-width: 0;
         }
 
         .forward-message-meta {

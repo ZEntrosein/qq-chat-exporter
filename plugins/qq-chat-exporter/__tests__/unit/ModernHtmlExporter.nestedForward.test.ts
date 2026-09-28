@@ -131,7 +131,7 @@ test('merged-forward card expands to every inner message with rich media', async
         id: `inner-${index}`,
         timestamp: Date.UTC(2026, 0, 1, 8, index),
         time: new Date(Date.UTC(2026, 0, 1, 8, index)).toISOString(),
-        sender: { name: `成员${index + 1}` },
+        sender: { name: `成员${index + 1}`, uin: String(10001 + index) },
         content: {
             text: index === 0 ? '[图片:detail.png]' : `完整消息${index + 1}`,
             elements: index === 0
@@ -158,6 +158,9 @@ test('merged-forward card expands to every inner message with rich media', async
     assert.ok(html.includes('forward-card-action-expand">展开'));
     assert.ok(html.includes('forward-card-action-collapse">收起'));
     assert.equal((html.match(/class="forward-message-item"/g) || []).length, 7);
+    assert.equal((html.match(/class="forward-message-avatar"/g) || []).length, 7);
+    assert.ok(html.includes('src="https://q1.qlogo.cn/g?b=qq&amp;nk=10001&amp;s=100"'), '应按子消息 QQ 号显示头像');
+    assert.ok(html.includes('class="forward-message-avatar-fallback"'), '头像加载失败时应有文字兜底');
     assert.ok(html.includes('完整消息7'), 'messages beyond the five-line preview must be retained');
     assert.ok(html.includes('src="./resources/images/detail.png"'), 'inner images should render in details');
     assert.ok(html.includes('<time class="forward-message-time">'), 'inner message timestamps should render');
@@ -179,6 +182,21 @@ test('forward cards without saved inner messages explain why they cannot expand'
     assert.ok(html.includes('forward-card-unavailable'));
     assert.ok(html.includes('详情未随导出保存'));
     assert.ok(!html.includes('<details class="forward-card forward-card-expandable'));
+});
+
+test('merged-forward sender without QQ number uses a visible text avatar fallback', () => {
+    const exporter = new ModernHtmlExporter({ outputPath: 'unused.html' });
+    const html = (exporter as any).renderForwardElement({
+        title: '聊天记录',
+        messages: [{
+            sender: { uid: 'u_internal', name: '测试用户' },
+            content: { text: '消息', elements: [{ type: 'text', data: { text: '消息' } }] },
+        }],
+    });
+
+    assert.match(html, /class="forward-message-avatar"/);
+    assert.match(html, /class="forward-message-avatar-fallback" style="display:inline-flex">测<\/span>/);
+    assert.doesNotMatch(html, /qlogo\.cn/);
 });
 
 test('forward preview hides bare media hashes from OneBot filenames', () => {

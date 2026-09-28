@@ -470,6 +470,209 @@ test('parseMessagesStream: 合并转发子消息媒体从 resourceMap 回填离�
     assert.equal(image.data.url, `resources/images/${process.platform === 'win32' ? 'node.exe' : 'node'}`);
 });
 
+test('forward sender avatar: 使用 senderUid 转换真实 QQ 号，不采信外层继承的 senderUin', async () => {
+    const previousBridge = (globalThis as any).__NAPCAT_BRIDGE__;
+    let conversionCount = 0;
+    (globalThis as any).__NAPCAT_BRIDGE__ = {
+        core: {
+            apis: {
+                UserApi: {
+                    async getUinByUidV2(uid: string) {
+                        conversionCount++;
+                        assert.equal(uid, 'u_real_member');
+                        return '22334455';
+                    },
+                },
+            },
+        },
+    };
+
+    try {
+        const parser = new SimpleMessageParser({ html: 'none' });
+        const children = [1, 2].map(index => rawMessage({
+            msgId: `forward-avatar-child-${index}`,
+            msgSeq: String(8900 + index),
+            senderUid: 'u_real_member',
+            senderUin: '1094950020', // 模拟 NapCat 错误继承的外层发送者
+            sendNickName: '真实成员',
+            elements: [{ textElement: { content: `消息${index}` } }],
+        }));
+        const top = rawMessage({
+            msgId: 'forward-avatar-top',
+            records: children,
+            elements: [{ multiForwardMsgElement: { resId: 'avatar-res', xmlContent: '' } }],
+        });
+
+        const [parsed] = await parser.parseMessages([top]);
+        const messages = parsed.content.elements.find(element => element.type === 'forward')!.data.messages;
+        assert.equal(messages[0].sender.uin, '22334455');
+        assert.equal(messages[0].sender.avatarUrl, 'https://q1.qlogo.cn/g?b=qq&nk=22334455&s=100');
+        assert.equal(messages[1].sender.avatarUrl, 'https://q1.qlogo.cn/g?b=qq&nk=22334455&s=100');
+        assert.equal(conversionCount, 1, '同一 UID 在同次导出中应只转换一次');
+    } finally {
+        if (previousBridge === undefined) delete (globalThis as any).__NAPCAT_BRIDGE__;
+        else (globalThis as any).__NAPCAT_BRIDGE__ = previousBridge;
+    }
+});
+
+test('forward sender avatar: UID 无法转换时不使用可疑的外层 senderUin', async () => {
+    const previousBridge = (globalThis as any).__NAPCAT_BRIDGE__;
+    (globalThis as any).__NAPCAT_BRIDGE__ = { core: { apis: {} } };
+    try {
+        const parser = new SimpleMessageParser({ html: 'none' });
+        const child = rawMessage({
+            msgId: 'forward-avatar-safe-child',
+            senderUid: 'u_unknown_member',
+            senderUin: '1094950020',
+            sendNickName: '无法转换成员',
+            elements: [{ textElement: { content: '消息' } }],
+        });
+        const top = rawMessage({
+            msgId: 'forward-avatar-safe-top',
+            records: [child],
+            elements: [{ multiForwardMsgElement: { resId: 'safe-avatar-res', xmlContent: '' } }],
+        });
+
+        const [parsed] = await parser.parseMessages([top]);
+        const sender = parsed.content.elements.find(element => element.type === 'forward')!.data.messages[0].sender;
+        assert.equal(sender.uin, undefined);
+        assert.equal(sender.avatarUrl, undefined);
+        assert.equal(sender.name, '无法转换成员');
+    } finally {
+        if (previousBridge === undefined) delete (globalThis as any).__NAPCAT_BRIDGE__;
+        else (globalThis as any).__NAPCAT_BRIDGE__ = previousBridge;
+    }
+});
+
+test('forward sender avatar: 使用原始 MultiMsg 节点自带的签名头像 URL', async () => {
+    const previousBridge = (globalThis as any).__NAPCAT_BRIDGE__;
+    (globalThis as any).__NAPCAT_BRIDGE__ = {
+        core: {
+            apis: {
+                MsgApi: {
+                    async getMultiMsg() {
+                        return {
+                            msgList: [
+                                rawMessage({
+                                    msgId: 'shared-forward-id',
+                                    msgSeq: 'same-seq',
+                                    clientSeq: '71001',
+                                    senderUid: '',
+                                    senderUin: '1094950020',
+                                    sendNickName: '错误名字',
+                                    elements: [{ textElement: { content: '第一条' } }],
+                                }),
+                                rawMessage({
+                                    msgId: 'shared-forward-id',
+                                    msgSeq: 'same-seq',
+                                    clientSeq: '71002',
+                                    senderUid: '',
+                                    senderUin: '1094950020',
+                                    sendNickName: '错误名字',
+                                    elements: [{ textElement: { content: '第二条' } }],
+                                }),
+                            ],
+                        };
+                    },
+                },
+                PacketApi: {
+                    pkt: {
+                        operation: {
+                            async FetchForwardMsgRaw(resId: string) {
+                                assert.equal(resId, 'identity-res-id');
+                                return [{
+                                    actionCommand: 'MultiMsg',
+                                    actionData: {
+                                        msgBody: [
+                                            {
+                                                contentHead: {
+                                                    newId: 'shared-forward-id',
+                                                    sequence: 71001,
+                                                    forward: { unknownBase64: 'http://qh.qlogo.cn/g?b=oidb&ek=avatar-a&s=0' },
+                                                },
+                                                responseHead: {
+                                                    fromUin: 1094950020,
+                                                    fromUid: 'u_anonymous_forward_owner',
+                                                    grp: { memberName: '成员甲' },
+                                                },
+                                            },
+                                            {
+                                                contentHead: {
+                                                    newId: 'shared-forward-id',
+                                                    sequence: 71002,
+                                                    forward: { unknownBase64: 'http://qh.qlogo.cn/g?b=oidb&ek=avatar-b&s=0' },
+                                                },
+                                                responseHead: {
+                                                    fromUin: 1094950020,
+                                                    fromUid: 'u_anonymous_forward_owner',
+                                                    grp: { memberName: '成员乙' },
+                                                },
+                                            },
+                                        ],
+                                    },
+                                }];
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        actions: { get() { return undefined; } },
+    };
+
+    try {
+        const parser = new SimpleMessageParser({ html: 'none' });
+        const top = rawMessage({
+            msgId: 'identity-forward-top',
+            records: [],
+            elements: [{
+                multiForwardMsgElement: {
+                    resId: 'identity-res-id',
+                    xmlContent: '<msg><summary>2条转发消息</summary></msg>',
+                },
+            }],
+        });
+
+        await parser.hydrateForwardRecords([top]);
+        assert.deepEqual(top.records.map((record: any) => ({
+            uid: record.senderUid,
+            uin: record.senderUin,
+            name: record.sendNickName,
+            avatarUrl: record.avatarUrl,
+            protocolAvatar: record.__qceForwardProtocolAvatar,
+        })), [
+            {
+                uid: '',
+                uin: '1094950020',
+                name: '成员甲',
+                avatarUrl: 'http://qh.qlogo.cn/g?b=oidb&ek=avatar-a&s=0',
+                protocolAvatar: true,
+            },
+            {
+                uid: '',
+                uin: '1094950020',
+                name: '成员乙',
+                avatarUrl: 'http://qh.qlogo.cn/g?b=oidb&ek=avatar-b&s=0',
+                protocolAvatar: true,
+            },
+        ]);
+
+        const [parsed] = await parser.parseMessages([top]);
+        const messages = parsed.content.elements.find(element => element.type === 'forward')!.data.messages;
+        assert.equal(messages[0].sender.name, '成员甲');
+        assert.equal(messages[0].sender.uid, undefined);
+        assert.equal(messages[0].sender.uin, undefined);
+        assert.equal(messages[0].sender.avatarUrl, 'http://qh.qlogo.cn/g?b=oidb&ek=avatar-a&s=0');
+        assert.equal(messages[1].sender.name, '成员乙');
+        assert.equal(messages[1].sender.uid, undefined);
+        assert.equal(messages[1].sender.uin, undefined);
+        assert.equal(messages[1].sender.avatarUrl, 'http://qh.qlogo.cn/g?b=oidb&ek=avatar-b&s=0');
+    } finally {
+        if (previousBridge === undefined) delete (globalThis as any).__NAPCAT_BRIDGE__;
+        else (globalThis as any).__NAPCAT_BRIDGE__ = previousBridge;
+    }
+});
+
 test('hydrateForwardRecords: 在资源扫描前把 get_forward_msg 子消息转换为原始 records', async () => {
     const previousBridge = (globalThis as any).__NAPCAT_BRIDGE__;
     const calls: string[] = [];
