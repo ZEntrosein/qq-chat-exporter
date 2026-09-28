@@ -7,6 +7,8 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { Readable } from 'stream';
+import { pipeline } from 'stream/promises';
 import { NapCatCore } from 'NapCatQQ/src/core/index.js';
 import { MessageElement, ElementType, RawMessage } from 'NapCatQQ/src/core/index.js';
 import { 
@@ -1202,6 +1204,112 @@ export class ResourceHandler {
     }
 
     /**
+     * downloadRichMedia 在部分 NapCat / QQNT 组合下会对视频返回空路径，
+     * 即使同一条消息仍能通过 getVideoUrl 取得 CDN 地址。这里沿用 NapCat
+     * OneBot 视频转换器的取址顺序，用 URL 作为视频下载的第二条路径。
+     */
+    private async downloadVideoByUrl(
+        message: RawMessage,
+        element: MessageElement,
+        resourceInfo: ResourceInfo,
+        localPath: string
+    ): Promise<string | null> {
+        if (!element.videoElement) return null;
+
+        const exposedFileApi = (this.core as any)?.apis?.FileApi || (this.core as any)?.apis?.file;
+        // Overlay 兼容层只公开 downloadMedia；NapCat 原始 FileApi 仍保存在 bridge 中，
+        // getVideoUrl / getVideoUrlPacket 需要从这里取得。
+        const bridgeFileApi = (globalThis as any)?.__NAPCAT_BRIDGE__?.core?.apis?.FileApi
+            || (globalThis as any)?.__NAPCAT_BRIDGE__?.core?.apis?.file;
+        const exposedSupportsVideoUrl = typeof exposedFileApi?.getVideoUrl === 'function'
+            || typeof exposedFileApi?.getVideoUrlPacket === 'function';
+        const fileApi = exposedSupportsVideoUrl
+            ? exposedFileApi
+            : (bridgeFileApi || exposedFileApi);
+        if (!fileApi) return null;
+
+        let videoUrl = '';
+        if (typeof fileApi.getVideoUrl === 'function') {
+            const peer = {
+                chatType: message.chatType,
+                peerUid: message.peerUid,
+                guildId: '0'
+            };
+            const parentMessageIds = (((message as any).parentMsgIdList || []) as unknown[]).map(String);
+            const messageIds = [String(message.msgId), ...parentMessageIds]
+                .filter((id, index, values) => id && values.indexOf(id) === index);
+            for (const sourceMessageId of messageIds) {
+                try {
+                    const wrappers = await fileApi.getVideoUrl(peer, sourceMessageId, element.elementId);
+                    const candidates = Array.isArray(wrappers) ? wrappers : [wrappers];
+                    videoUrl = candidates.find((candidate: any) => typeof candidate?.url === 'string' && candidate.url)?.url || '';
+                    if (videoUrl) break;
+                } catch (error) {
+                    console.warn('[ResourceHandler] getVideoUrl 获取视频地址失败:', error instanceof Error ? error.message : error);
+                }
+            }
+        }
+
+        if (!videoUrl && typeof fileApi.getVideoUrlPacket === 'function' && (element.videoElement as any).fileUuid) {
+            try {
+                videoUrl = await fileApi.getVideoUrlPacket(
+                    message.peerUid,
+                    (element.videoElement as any).fileUuid,
+                    1500
+                ) || '';
+            } catch (error) {
+                console.warn('[ResourceHandler] getVideoUrlPacket 获取视频地址失败:', error instanceof Error ? error.message : error);
+            }
+        }
+
+        if (!videoUrl && /^(https?:)?\/\//i.test(element.videoElement.filePath || '')) {
+            videoUrl = element.videoElement.filePath!;
+        }
+
+        if (!videoUrl) return null;
+        if (videoUrl.startsWith('//')) videoUrl = `https:${videoUrl}`;
+
+        const partialPath = `${localPath}.part`;
+        const controller = new AbortController();
+        const timeout = setTimeout(
+            () => controller.abort(),
+            Math.max(this.config.downloadTimeout, 120_000)
+        );
+
+        try {
+            await fs.promises.rm(partialPath, { force: true });
+            const response = await fetch(videoUrl, {
+                redirect: 'follow',
+                signal: controller.signal,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 QQChatExporter/5.5.77'
+                }
+            });
+            if (!response.ok || !response.body) {
+                throw new Error(`视频URL下载失败: HTTP ${response.status}`);
+            }
+
+            await pipeline(
+                Readable.fromWeb(response.body as any),
+                fs.createWriteStream(partialPath)
+            );
+            const stats = await fs.promises.stat(partialPath);
+            if (stats.size <= 0) throw new Error('视频URL下载结果为空');
+
+            await fs.promises.rm(localPath, { force: true });
+            await fs.promises.rename(partialPath, localPath);
+            resourceInfo.originalUrl = videoUrl;
+            return localPath;
+        } catch (error) {
+            await fs.promises.rm(partialPath, { force: true }).catch(() => undefined);
+            console.warn('[ResourceHandler] 视频URL回退下载失败:', error instanceof Error ? error.message : error);
+            return null;
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
+    /**
      * 下载资源
      */
     private async downloadResource(message: RawMessage, element: MessageElement, resourceInfo: ResourceInfo): Promise<string> {
@@ -1280,16 +1388,30 @@ export class ResourceHandler {
                 }
             } else {
                 // 其他类型资源的下载（音频、视频、文件等）
-                const downloadedPath = await this.core.apis.FileApi.downloadMedia(
-                    message.msgId,
-                    message.chatType as any,
-                    message.peerUid,
-                    element.elementId,
-                    '', // thumbPath
-                    localPath, // sourcePath
-                    this.config.downloadTimeout,
-                    true // force
-                );
+                let downloadedPath = '';
+                let downloadError: unknown;
+                try {
+                    downloadedPath = await this.core.apis.FileApi.downloadMedia(
+                        message.msgId,
+                        message.chatType as any,
+                        message.peerUid,
+                        element.elementId,
+                        '', // thumbPath
+                        localPath, // sourcePath
+                        this.config.downloadTimeout,
+                        true // force
+                    );
+                } catch (error) {
+                    downloadError = error;
+                }
+
+                // NapCat 的 downloadRichMedia 偶尔会对视频返回空路径；此时
+                // getVideoUrl 仍可返回有效 CDN 地址，优先用它恢复视频文件。
+                if ((!downloadedPath || downloadError) && resourceInfo.type === 'video') {
+                    const fallbackPath = await this.downloadVideoByUrl(message, element, resourceInfo, localPath);
+                    if (fallbackPath) return fallbackPath;
+                }
+                if (downloadError) throw downloadError;
                 
                 // 检查下载返回路径是否有效
                 if (!downloadedPath || downloadedPath.trim() === '') {

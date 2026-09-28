@@ -67,6 +67,16 @@ export class ZipExporter {
                 // 添加HTML文件到ZIP根目录
                 archive.file(htmlPath, { name: htmlFileName });
 
+                // 显式保留标准资源目录。ZIP 默认不会记录空目录；当某类媒体
+                // 下载全部失败或本次没有该类型时，解压后仍应保持一致结构，
+                // 也方便用户一眼区分“目录为空”和“打包漏掉目录”。
+                const resourcesRoot = path.join(htmlDir, 'resources');
+                if (fs.existsSync(resourcesRoot) && fs.statSync(resourcesRoot).isDirectory()) {
+                    for (const resourceDir of ['images', 'videos', 'audios', 'files']) {
+                        archive.append('', { name: `resources/${resourceDir}/` });
+                    }
+                }
+
                 // 添加指定的资源文件
                 if (resourcePaths.length > 0) {
                     // 同一个媒体可能被多条消息引用，导出器会多次返回相同路径。

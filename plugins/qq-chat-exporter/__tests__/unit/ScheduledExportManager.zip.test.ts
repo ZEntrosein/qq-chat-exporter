@@ -83,6 +83,10 @@ test('HTML scheduled export creates an isolated ZIP and removes its staging dire
         assert.ok(fs.statSync(history.filePath).size > 0);
         const entries = listCentralDirectoryEntries(history.filePath);
         assert.equal(entries.filter((entry) => entry === 'resources/images/test.png').length, 1);
+        assert.ok(entries.includes('resources/images/'));
+        assert.ok(entries.includes('resources/videos/'));
+        assert.ok(entries.includes('resources/audios/'));
+        assert.ok(entries.includes('resources/files/'));
         assert.equal(fs.existsSync(path.join(tempDir, '.qce-scheduled-staging')), false);
         assert.equal(fs.readdirSync(tempDir).filter((name) => name.endsWith('.html')).length, 0);
     } finally {
