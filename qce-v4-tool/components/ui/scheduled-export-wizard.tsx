@@ -64,6 +64,7 @@ export function ScheduledExportWizard({
     includeSystemMessages: true,
     filterPureImageMessages: false,
     preferGroupMemberName: true,
+    exportAsZip: false,
     // Issue #344：定时导出也支持按资源类型逐项跳过下载。
     skipDownloadResourceTypes: undefined as SkipDownloadResourceType[] | undefined,
   })
@@ -121,6 +122,7 @@ export function ScheduledExportWizard({
           ? prefilledData.filterPureImageMessages 
           : defaultFilter,
         preferGroupMemberName: prefilledData.preferGroupMemberName !== undefined ? prefilledData.preferGroupMemberName : true,
+        exportAsZip: prefilledData.exportAsZip === true,
         skipDownloadResourceTypes: Array.isArray(prefilledData.skipDownloadResourceTypes) && prefilledData.skipDownloadResourceTypes.length > 0
           ? (prefilledData.skipDownloadResourceTypes as SkipDownloadResourceType[])
           : undefined,
@@ -158,6 +160,7 @@ export function ScheduledExportWizard({
         includeSystemMessages: true,
         filterPureImageMessages: false,
         preferGroupMemberName: true,
+        exportAsZip: false,
         skipDownloadResourceTypes: undefined,
       })
       setSelectedTargets([])
@@ -212,6 +215,7 @@ export function ScheduledExportWizard({
         includeSystemMessages: baseForm.includeSystemMessages,
         filterPureImageMessages: baseForm.filterPureImageMessages,
         preferGroupMemberName: baseForm.preferGroupMemberName,
+        exportAsZip: baseForm.format === "HTML" && baseForm.exportAsZip,
         ...(!baseForm.filterPureImageMessages && baseForm.skipDownloadResourceTypes && baseForm.skipDownloadResourceTypes.length > 0 && {
           skipDownloadResourceTypes: baseForm.skipDownloadResourceTypes,
         }),
@@ -829,6 +833,14 @@ export function ScheduledExportWizard({
 
                 <div className="space-y-3">
                   {[
+                    {
+                      id: "exportAsZip",
+                      checked: baseForm.exportAsZip,
+                      set: (v: boolean) => setBaseForm(p => ({ ...p, exportAsZip: v })),
+                      title: "每次导出为独立 ZIP",
+                      desc: "将本次 HTML 和它引用的图片、语音、视频、文件打包到同一个 ZIP；不同周期不再共用 resources 文件夹。",
+                      visible: baseForm.format === "HTML",
+                    },
                     {
                       id: "includeResourceLinks",
                       checked: baseForm.includeResourceLinks,

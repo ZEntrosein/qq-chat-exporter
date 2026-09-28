@@ -86,6 +86,7 @@ import { RawMessage } from 'NapCatQQ/src/core/types.js';
 import path from 'path';
 import fs from 'fs';
 import { PathManager } from '../../utils/PathManager.js';
+import { ZipExporter } from '../../utils/ZipExporter.js';
 
 /**
  * 定时规则类型
@@ -162,6 +163,8 @@ export interface ScheduledExportConfig {
         showSearchBar?: boolean;
         /** Issue #467: 仅对 HTML 格式生效，是否启用虚拟滚动（默认 true）。 */
         enableVirtualScroll?: boolean;
+        /** 仅对 HTML 格式生效，将本次导出的 HTML 和资源打包为独立 ZIP。 */
+        exportAsZip?: boolean;
     };
     /** 备份模式（新增） */
     backupMode?: BackupMode;
@@ -631,8 +634,22 @@ export class ScheduledExportManager {
             if (!fs.existsSync(outputDir)) {
                 fs.mkdirSync(outputDir, { recursive: true });
             }
-            
-            const filePath = path.join(outputDir, fileName);
+
+            // ZIP 模式在本次任务专属的临时目录中生成 HTML 和 resources，避免与
+            // 其他周期的定时导出共用同一个 resources 目录。打包成功后只清理该目录。
+            const shouldPackageAsZip = task.format.toUpperCase() === 'HTML'
+                && task.options.exportAsZip === true;
+            const stagingRoot = path.join(outputDir, '.qce-scheduled-staging');
+            const exportDir = shouldPackageAsZip
+                ? path.join(stagingRoot, `${sessionName}_${timestamp}_${historyId}`)
+                : outputDir;
+            if (!fs.existsSync(exportDir)) {
+                fs.mkdirSync(exportDir, { recursive: true });
+            }
+
+            let finalFilePath = path.join(exportDir, fileName);
+            let zipPackagingFailed = false;
+            let zipPackagingError: string | undefined;
 
             // 导出文件
             const selfInfo = this.core.selfInfo;
@@ -652,7 +669,7 @@ export class ScheduledExportManager {
                 case 'HTML':
                     // 🚀 使用流式导出HTML，优化内存占用
                     const htmlExporter = new ModernHtmlExporter({
-                        outputPath: filePath,
+                        outputPath: finalFilePath,
                         includeResourceLinks: task.options.includeResourceLinks ?? true,
                         includeSystemMessages: task.options.includeSystemMessages ?? true,
                         // Issue #311: 自包含 HTML（资源 base64 内联）
@@ -665,7 +682,33 @@ export class ScheduledExportManager {
                             : {})
                     });
                     const htmlMessageStream = parser.parseMessagesStream(allMessages, resourceMap);
-                    await htmlExporter.exportFromIterable(htmlMessageStream, chatInfo);
+                    const copiedResourcePaths = await htmlExporter.exportFromIterable(htmlMessageStream, chatInfo);
+
+                    if (shouldPackageAsZip) {
+                        const zipFileName = fileName.replace(/\.html$/i, '.zip');
+                        const zipFilePath = path.join(outputDir, zipFileName);
+                        try {
+                            await ZipExporter.createZip(finalFilePath, zipFilePath, copiedResourcePaths);
+                            finalFilePath = zipFilePath;
+                            fs.rmSync(exportDir, { recursive: true, force: true });
+                            try {
+                                if (fs.existsSync(stagingRoot) && fs.readdirSync(stagingRoot).length === 0) {
+                                    fs.rmdirSync(stagingRoot);
+                                }
+                            } catch {
+                                // 空临时目录清理失败不影响已经生成的 ZIP。
+                            }
+                        } catch (zipError) {
+                            zipPackagingFailed = true;
+                            zipPackagingError = zipError instanceof Error ? zipError.message : String(zipError);
+                            // 删除可能存在的不完整 ZIP；HTML 和本次 resources 保留在独立目录中以便恢复。
+                            try {
+                                if (fs.existsSync(zipFilePath)) fs.unlinkSync(zipFilePath);
+                            } catch {
+                                // ignore
+                            }
+                        }
+                    }
                     break;
                 case 'JSON':
                     // JsonExporter 会自己处理消息解析（流式），直接传原始消息
@@ -674,7 +717,7 @@ export class ScheduledExportManager {
                     // 之前定时任务漏传 resourceMap，导致定时 JSON 不会落地聊天文件，用户需要
                     // 同时勾选 HTML 才能拿到群文件等附件。
                     const jsonExporter = new JsonExporter({
-                        outputPath: filePath,
+                        outputPath: finalFilePath,
                         includeResourceLinks: task.options.includeResourceLinks ?? true,
                         includeSystemMessages: task.options.includeSystemMessages ?? true,
                         filterPureImageMessages: task.options.filterPureImageMessages ?? false,
@@ -689,7 +732,7 @@ export class ScheduledExportManager {
                 case 'TXT':
                     // TextExporter 会自己处理消息解析，直接传原始消息
                     const textExporter = new TextExporter({
-                        outputPath: filePath,
+                        outputPath: finalFilePath,
                         includeResourceLinks: task.options.includeResourceLinks ?? true,
                         includeSystemMessages: task.options.includeSystemMessages ?? true,
                         filterPureImageMessages: task.options.filterPureImageMessages ?? false,
@@ -702,16 +745,19 @@ export class ScheduledExportManager {
                     break;
             }
 
-            const stats = fs.statSync(filePath);
+            const stats = fs.statSync(finalFilePath);
 
             // issue #363：如果本次有资源下载失败，把状态降级为 partial，让用户在执行历史
             // 列表上一眼就能看出来「本次导出文件出来了但漏了点东西」。
-            history.status = (history.resourceSummary && history.resourceSummary.failed > 0)
+            history.status = zipPackagingFailed || (history.resourceSummary && history.resourceSummary.failed > 0)
                 ? 'partial'
                 : 'success';
             history.messageCount = allMessages.length;
-            history.filePath = filePath;
+            history.filePath = finalFilePath;
             history.fileSize = stats.size;
+            if (zipPackagingFailed) {
+                history.error = `ZIP 打包失败，已保留本次独立导出目录：${zipPackagingError}`;
+            }
 
             // 更新任务的上次执行时间
             task.lastRun = new Date();

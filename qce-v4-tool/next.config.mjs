@@ -30,7 +30,11 @@ const nextConfig = {
   // 确保构建输出目录为 out (默认值)
   distDir: '.next',
   // Turbopack 配置
-  turbopack: {},
+  turbopack: {
+    // 本地 Windows 构建会把 pnpm 虚拟仓库放到较短的工作区路径，避免依赖路径超长。
+    // 根目录需要同时覆盖前端源码和虚拟仓库，否则 Turbopack 会拒绝解析依赖。
+    root: path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..'),
+  },
   // 环境变量注入
   env: {
     QCE_VERSION: process.env.QCE_VERSION || getVersionFromPlugin(),

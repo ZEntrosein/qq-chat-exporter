@@ -429,6 +429,8 @@ export interface CreateScheduledExportForm {
   includeSystemMessages?: boolean
   filterPureImageMessages?: boolean
   preferGroupMemberName?: boolean
+  /** 仅 HTML：将每次定时导出打包成包含独立 resources 的 ZIP */
+  exportAsZip?: boolean
   /** Issue #341: 仅保留元数据、跳过下载的资源类型 */
   skipDownloadResourceTypes?: Array<'image' | 'video' | 'audio' | 'file'>
 }

@@ -26,6 +26,7 @@ export interface ScheduledExportConfig {
         filterPureImageMessages?: boolean;
         prettyFormat?: boolean;
         preferGroupMemberName?: boolean;
+        exportAsZip?: boolean;
     };
     enabled: boolean;
     createdAt?: string;
@@ -103,6 +104,7 @@ export function useScheduledExports() {
                     filterPureImageMessages: formData.filterPureImageMessages ?? false,
                     prettyFormat: true,
                     preferGroupMemberName: formData.preferGroupMemberName ?? true,
+                    exportAsZip: formData.exportAsZip === true,
                     ...(Array.isArray(formData.skipDownloadResourceTypes) && formData.skipDownloadResourceTypes.length > 0 && {
                         skipDownloadResourceTypes: formData.skipDownloadResourceTypes,
                     }),
