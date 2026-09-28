@@ -224,6 +224,20 @@ export interface ExecutionHistory {
     };
 }
 
+export type ScheduledExportProgressStatus = 'idle' | 'queued' | 'running' | 'success' | 'partial' | 'failed';
+
+/** 最近一次执行的轻量进度；仅保存在内存中，不改变现有数据库格式。 */
+export interface ScheduledExportProgress {
+    taskId: string;
+    status: ScheduledExportProgressStatus;
+    progress: number;
+    stage: 'idle' | 'fetching' | 'resources' | 'exporting' | 'packaging' | 'complete';
+    message: string;
+    startedAt?: string;
+    updatedAt: string;
+    historyId?: string;
+}
+
 /**
  * 定时导出管理器
  */
@@ -235,6 +249,8 @@ export class ScheduledExportManager {
     private scheduledTasks: Map<string, ScheduledExportConfig> = new Map();
     private cronJobs: Map<string, ScheduledTask> = new Map();
     private executionHistory: Map<string, ExecutionHistory[]> = new Map();
+    private runningTasks: Map<string, Promise<ExecutionHistory>> = new Map();
+    private executionProgress: Map<string, ScheduledExportProgress> = new Map();
     
     constructor(core: NapCatCore, dbManager: DatabaseManager, resourceHandler: ResourceHandler) {
         this.core = core;
@@ -343,13 +359,35 @@ export class ScheduledExportManager {
     /**
      * 手动触发定时导出任务
      */
-    async triggerScheduledExport(id: string): Promise<ExecutionHistory | null> {
+    triggerScheduledExport(id: string): { started: boolean; progress: ScheduledExportProgress } | null {
         const task = this.scheduledTasks.get(id);
         if (!task) {
             return null;
         }
 
-        return await this.executeExportTask(task);
+        const alreadyRunning = this.runningTasks.has(id);
+        void this.startTaskExecution(task).catch(() => {
+            // executeExportTask 会记录错误状态；这里仅防止后台 Promise 形成未处理拒绝。
+        });
+        return {
+            started: !alreadyRunning,
+            progress: this.getExecutionProgress(id)!
+        };
+    }
+
+    /** 获取任务当前或最近一次执行进度。 */
+    getExecutionProgress(id: string): ScheduledExportProgress | null {
+        const progress = this.executionProgress.get(id);
+        if (progress) return { ...progress };
+        if (!this.scheduledTasks.has(id)) return null;
+        return {
+            taskId: id,
+            status: 'idle',
+            progress: 0,
+            stage: 'idle',
+            message: '等待执行',
+            updatedAt: new Date().toISOString()
+        };
     }
 
     /**
@@ -368,7 +406,7 @@ export class ScheduledExportManager {
         void (async () => {
             for (const task of targets) {
                 try {
-                    await this.executeExportTask(task);
+                    await this.startTaskExecution(task);
                 } catch {
                     // 单个任务失败不影响后续任务，结果已记录在执行历史中。
                 }
@@ -506,7 +544,7 @@ export class ScheduledExportManager {
         }
 
         const cronJob = SimpleCronScheduler.schedule(cronExpression, async () => {
-            await this.executeExportTask(task);
+            await this.startTaskExecution(task);
         }, {
             scheduled: true,
             timezone: 'Asia/Shanghai'
@@ -538,6 +576,46 @@ export class ScheduledExportManager {
     }
 
     /**
+     * 同一个任务只允许一个执行实例。重复点击或 cron 与手动触发相撞时复用
+     * 正在运行的 Promise，避免重复下载和同时写同一个 ZIP。
+     */
+    private startTaskExecution(task: ScheduledExportConfig): Promise<ExecutionHistory> {
+        const running = this.runningTasks.get(task.id);
+        if (running) return running;
+
+        const now = new Date().toISOString();
+        this.executionProgress.set(task.id, {
+            taskId: task.id,
+            status: 'queued',
+            progress: 1,
+            stage: 'fetching',
+            message: '任务已加入执行队列',
+            startedAt: now,
+            updatedAt: now
+        });
+
+        const execution = this.executeExportTask(task).finally(() => {
+            this.runningTasks.delete(task.id);
+        });
+        this.runningTasks.set(task.id, execution);
+        return execution;
+    }
+
+    private updateExecutionProgress(
+        taskId: string,
+        updates: Partial<Omit<ScheduledExportProgress, 'taskId' | 'startedAt'>>
+    ): void {
+        const current = this.executionProgress.get(taskId);
+        if (!current) return;
+        this.executionProgress.set(taskId, {
+            ...current,
+            ...updates,
+            progress: Math.max(0, Math.min(100, updates.progress ?? current.progress)),
+            updatedAt: new Date().toISOString()
+        });
+    }
+
+    /**
      * 执行导出任务
      */
     private async executeExportTask(task: ScheduledExportConfig): Promise<ExecutionHistory> {
@@ -553,6 +631,13 @@ export class ScheduledExportManager {
         };
 
         try {
+            this.updateExecutionProgress(task.id, {
+                status: 'running',
+                progress: 5,
+                stage: 'fetching',
+                message: '正在读取聊天消息',
+                historyId
+            });
             // 计算时间范围
             const timeRange = this.calculateTimeRange(task.timeRangeType, task.customTimeRange);
             
@@ -572,6 +657,10 @@ export class ScheduledExportManager {
 
             for await (const batch of messageGenerator) {
                 allMessages.push(...batch);
+                this.updateExecutionProgress(task.id, {
+                    progress: 20,
+                    message: `已读取 ${allMessages.length} 条消息`
+                });
             }
 
             if (allMessages.length === 0) {
@@ -608,8 +697,20 @@ export class ScheduledExportManager {
                 // older ResourceHandler 没有该方法时忽略
             }
 
+            this.updateExecutionProgress(task.id, {
+                progress: 35,
+                stage: 'resources',
+                message: `正在处理 ${allMessages.length} 条消息中的媒体资源`
+            });
+
             // 下载资源（受 skipDownloadResourceTypes 影响）
             const resourceMap = await this.resourceHandler.processMessageResources(allMessages);
+
+            this.updateExecutionProgress(task.id, {
+                progress: 65,
+                stage: 'exporting',
+                message: '资源处理完成，正在生成导出文件'
+            });
 
             // issue #363：留下本次资源下载摘要，让 UI 能直接告诉用户本次有几个资源没拿到。
             try {
@@ -685,6 +786,11 @@ export class ScheduledExportManager {
                     const copiedResourcePaths = await htmlExporter.exportFromIterable(htmlMessageStream, chatInfo);
 
                     if (shouldPackageAsZip) {
+                        this.updateExecutionProgress(task.id, {
+                            progress: 90,
+                            stage: 'packaging',
+                            message: '正在去重并打包 ZIP'
+                        });
                         const zipFileName = fileName.replace(/\.html$/i, '.zip');
                         const zipFilePath = path.join(outputDir, zipFileName);
                         try {
@@ -770,6 +876,19 @@ export class ScheduledExportManager {
             history.error = error instanceof Error ? error.message : String(error);
         } finally {
             history.duration = Date.now() - startTime;
+
+            const finalMessage = history.status === 'success'
+                ? (history.messageCount === 0 ? '执行完成：没有符合条件的消息' : '导出完成')
+                : history.status === 'partial'
+                    ? (history.error || '导出完成，但部分资源处理失败')
+                    : (history.error || '导出失败');
+            this.updateExecutionProgress(task.id, {
+                status: history.status,
+                progress: 100,
+                stage: 'complete',
+                message: finalMessage,
+                historyId
+            });
             
             // 保存执行历史
             if (!this.executionHistory.has(task.id)) {

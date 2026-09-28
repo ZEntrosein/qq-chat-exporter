@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { toast } from '@/components/ui/use-toast';
 import { useApi } from './use-api';
 import type { APIResponse, CreateScheduledExportForm } from '@/types/api';
@@ -27,11 +27,54 @@ export interface ScheduledExportConfig {
         prettyFormat?: boolean;
         preferGroupMemberName?: boolean;
         exportAsZip?: boolean;
+        skipDownloadResourceTypes?: Array<'image' | 'video' | 'audio' | 'file'>;
     };
+    outputDir?: string | null;
     enabled: boolean;
     createdAt?: string;
     lastRun?: string;
     nextRun?: string;
+}
+
+export interface ScheduledExportProgress {
+    taskId: string;
+    status: 'idle' | 'queued' | 'running' | 'success' | 'partial' | 'failed';
+    progress: number;
+    stage: 'idle' | 'fetching' | 'resources' | 'exporting' | 'packaging' | 'complete';
+    message: string;
+    startedAt?: string;
+    updatedAt: string;
+    historyId?: string;
+}
+
+function formToScheduledExportConfig(formData: CreateScheduledExportForm): ScheduledExportConfig {
+    return {
+        name: formData.name,
+        peer: {
+            chatType: formData.chatType,
+            peerUid: formData.peerUid,
+            guildId: "",
+        },
+        scheduleType: formData.scheduleType,
+        executeTime: formData.executeTime,
+        cronExpression: formData.cronExpression,
+        timeRangeType: formData.timeRangeType,
+        customTimeRange: formData.customTimeRange,
+        format: formData.format as 'JSON' | 'HTML' | 'TXT',
+        options: {
+            includeResourceLinks: formData.includeResourceLinks ?? true,
+            includeSystemMessages: formData.includeSystemMessages ?? true,
+            filterPureImageMessages: formData.filterPureImageMessages ?? false,
+            prettyFormat: true,
+            preferGroupMemberName: formData.preferGroupMemberName ?? true,
+            exportAsZip: formData.exportAsZip === true,
+            skipDownloadResourceTypes: Array.isArray(formData.skipDownloadResourceTypes)
+                ? formData.skipDownloadResourceTypes
+                : undefined,
+        },
+        outputDir: formData.outputDir?.trim() || null,
+        enabled: formData.enabled,
+    };
 }
 
 export interface ExecutionHistory {
@@ -50,6 +93,8 @@ export function useScheduledExports() {
     const [tasks, setTasks] = useState<(ScheduledExportConfig & { id: string })[]>([]);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [executionProgress, setExecutionProgress] = useState<Record<string, ScheduledExportProgress>>({});
+    const progressPolls = useRef(new Set<string>());
     const { apiCall } = useApi();
 
     // 获取所有定时导出任务
@@ -85,33 +130,7 @@ export function useScheduledExports() {
         try {
             setLoading(true);
             
-            const config: ScheduledExportConfig = {
-                name: formData.name,
-                peer: {
-                    chatType: formData.chatType,
-                    peerUid: formData.peerUid,
-                    guildId: "",
-                },
-                scheduleType: formData.scheduleType,
-                executeTime: formData.executeTime,
-                cronExpression: formData.cronExpression,
-                timeRangeType: formData.timeRangeType,
-                customTimeRange: formData.customTimeRange,
-                format: formData.format as 'JSON' | 'HTML' | 'TXT',
-                options: {
-                    includeResourceLinks: formData.includeResourceLinks ?? true,
-                    includeSystemMessages: formData.includeSystemMessages ?? true,
-                    filterPureImageMessages: formData.filterPureImageMessages ?? false,
-                    prettyFormat: true,
-                    preferGroupMemberName: formData.preferGroupMemberName ?? true,
-                    exportAsZip: formData.exportAsZip === true,
-                    ...(Array.isArray(formData.skipDownloadResourceTypes) && formData.skipDownloadResourceTypes.length > 0 && {
-                        skipDownloadResourceTypes: formData.skipDownloadResourceTypes,
-                    }),
-                },
-                ...(formData.outputDir?.trim() && { outputDir: formData.outputDir.trim() }),
-                enabled: formData.enabled,
-            };
+            const config = formToScheduledExportConfig(formData);
             
             const response = await apiCall('/api/scheduled-exports', {
                 method: 'POST',
@@ -174,6 +193,10 @@ export function useScheduledExports() {
         }
     }, [apiCall, fetchTasks]);
 
+    const updateTaskFromForm = useCallback(async (id: string, formData: CreateScheduledExportForm) => {
+        return await updateTask(id, formToScheduledExportConfig(formData));
+    }, [updateTask]);
+
     // 删除定时导出任务
     const deleteTask = useCallback(async (id: string) => {
         try {
@@ -213,14 +236,43 @@ export function useScheduledExports() {
             
             const response = await apiCall(`/api/scheduled-exports/${id}/trigger`, {
                 method: 'POST',
-            }) as APIResponse<{ message: string }>;
+            }) as APIResponse<{ started: boolean; progress: ScheduledExportProgress }>;
             
-            if (response.success) {
+            if (response.success && response.data) {
+                const { started, progress } = response.data;
+                setExecutionProgress(current => ({ ...current, [id]: progress }));
                 toast({
-                    title: "成功",
-                    description: "任务触发成功，正在后台执行"
+                    title: started ? "已开始执行" : "任务正在执行",
+                    description: started ? "可在任务列表中查看实时进度" : "已阻止重复启动，将继续显示现有任务进度"
                 });
-                await fetchTasks(); // 刷新列表
+
+                if (!progressPolls.current.has(id)) {
+                    progressPolls.current.add(id);
+                    void (async () => {
+                        try {
+                            while (true) {
+                                await new Promise(resolve => setTimeout(resolve, 1000));
+                                const progressResponse = await apiCall(`/api/scheduled-exports/${id}/progress`) as APIResponse<ScheduledExportProgress>;
+                                if (!progressResponse.success || !progressResponse.data) break;
+                                const next = progressResponse.data;
+                                setExecutionProgress(current => ({ ...current, [id]: next }));
+                                if (['success', 'partial', 'failed'].includes(next.status)) {
+                                    toast({
+                                        title: next.status === 'failed' ? "执行失败" : next.status === 'partial' ? "部分完成" : "执行完成",
+                                        description: next.message,
+                                        ...(next.status === 'failed' ? { variant: "destructive" as const } : {})
+                                    });
+                                    await fetchTasks();
+                                    break;
+                                }
+                            }
+                        } catch (pollError) {
+                            console.error('获取任务执行进度失败:', pollError);
+                        } finally {
+                            progressPolls.current.delete(id);
+                        }
+                    })();
+                }
                 return response.data;
             } else {
                 throw new Error(response.error?.message || '触发任务失败');
@@ -284,11 +336,13 @@ export function useScheduledExports() {
 
     return {
         scheduledExports: tasks,
+        executionProgress,
         loading,
         error,
         loadScheduledExports: fetchTasks,
         createScheduledExport: createTask,
         updateScheduledExport: updateTask,
+        updateScheduledExportFromForm: updateTaskFromForm,
         deleteScheduledExport: deleteTask,
         triggerScheduledExport: triggerTask,
         toggleScheduledExport: async (id: string, enabled: boolean) => {

@@ -68,7 +68,7 @@ import {
 } from "lucide-react"
 import type { CreateTaskForm, CreateScheduledExportForm } from "@/types/api"
 import { useQCE } from "@/hooks/use-qce"
-import { useScheduledExports } from "@/hooks/use-scheduled-exports"
+import { useScheduledExports, type ScheduledExportConfig } from "@/hooks/use-scheduled-exports"
 import { useChatHistory } from "@/hooks/use-chat-history"
 import { useStickerPacks } from "@/hooks/use-sticker-packs"
 import { useResourceIndex } from "@/hooks/use-resource-index"
@@ -84,6 +84,7 @@ export default function QCEDashboard() {
   const [selectedPreset, setSelectedPreset] = useState<Partial<CreateTaskForm> | undefined>()
   const [isScheduledExportWizardOpen, setIsScheduledExportWizardOpen] = useState(false)
   const [selectedScheduledPreset, setSelectedScheduledPreset] = useState<Partial<CreateScheduledExportForm> | undefined>()
+  const [editingScheduledExportId, setEditingScheduledExportId] = useState<string | null>(null)
   const [isHistoryModalOpen, setIsHistoryModalOpen] = useState(false)
   const [selectedHistoryTask, setSelectedHistoryTask] = useState<{id: string, name: string} | null>(null)
   const [isPreviewModalOpen, setIsPreviewModalOpen] = useState(false)
@@ -431,11 +432,13 @@ export default function QCEDashboard() {
 
   const {
     scheduledExports,
+    executionProgress,
     loading: scheduledLoading,
     error: scheduledError,
     loadScheduledExports,
     createScheduledExport,
     updateScheduledExport,
+    updateScheduledExportFromForm,
     deleteScheduledExport,
     triggerScheduledExport,
     toggleScheduledExport,
@@ -513,13 +516,40 @@ export default function QCEDashboard() {
   }
 
   const handleOpenScheduledExportWizard = (preset?: Partial<CreateScheduledExportForm>) => {
+    setEditingScheduledExportId(null)
     setSelectedScheduledPreset(preset)
+    setIsScheduledExportWizardOpen(true)
+  }
+
+  const handleEditScheduledExport = (task: ScheduledExportConfig & { id: string }) => {
+    setEditingScheduledExportId(task.id)
+    setSelectedScheduledPreset({
+      name: task.name,
+      chatType: task.peer.chatType,
+      peerUid: task.peer.peerUid,
+      sessionName: task.name,
+      scheduleType: task.scheduleType,
+      cronExpression: task.cronExpression,
+      executeTime: task.executeTime,
+      timeRangeType: task.timeRangeType,
+      customTimeRange: task.customTimeRange,
+      format: task.format,
+      enabled: task.enabled,
+      outputDir: task.outputDir || "",
+      includeResourceLinks: task.options.includeResourceLinks,
+      includeSystemMessages: task.options.includeSystemMessages,
+      filterPureImageMessages: task.options.filterPureImageMessages,
+      preferGroupMemberName: task.options.preferGroupMemberName,
+      exportAsZip: task.options.exportAsZip,
+      skipDownloadResourceTypes: task.options.skipDownloadResourceTypes,
+    })
     setIsScheduledExportWizardOpen(true)
   }
 
   const handleCloseScheduledExportWizard = () => {
     setIsScheduledExportWizardOpen(false)
     setSelectedScheduledPreset(undefined)
+    setEditingScheduledExportId(null)
   }
 
   const handleOpenHistoryModal = (taskId: string, taskName: string) => {
@@ -1924,7 +1954,10 @@ export default function QCEDashboard() {
                   <div className="space-y-0.5">
                     {scheduledExports
                       .filter(se => scheduledFilter === 'all' || (scheduledFilter === 'enabled' ? se.enabled : !se.enabled))
-                      .map((scheduledExport) => (
+                      .map((scheduledExport) => {
+                        const progress = executionProgress[scheduledExport.id]
+                        const isRunning = progress?.status === 'queued' || progress?.status === 'running'
+                        return (
                       <div
                         key={scheduledExport.id}
                         className="group flex items-center justify-between px-3 py-2.5 rounded-lg hover:bg-black/[0.03] dark:hover:bg-white/[0.03] transition-colors"
@@ -1973,10 +2006,24 @@ export default function QCEDashboard() {
                                 </>
                               )}
                             </div>
+                            {isRunning && progress && (
+                              <div className="mt-2 max-w-md">
+                                <div className="flex items-center justify-between text-[10px] text-blue-600 dark:text-blue-400 mb-1">
+                                  <span className="truncate pr-3">{progress.message}</span>
+                                  <span>{progress.progress}%</span>
+                                </div>
+                                <div className="h-1 rounded-full bg-blue-100 dark:bg-blue-950/50 overflow-hidden">
+                                  <div
+                                    className="h-full bg-blue-500 transition-all duration-300"
+                                    style={{ width: `${progress.progress}%` }}
+                                  />
+                                </div>
+                              </div>
+                            )}
                           </div>
                         </div>
 
-                        <div className="flex items-center gap-0.5 flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <div className={`flex items-center gap-0.5 flex-shrink-0 transition-opacity ${isRunning ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
                           <button
                             className="px-2 py-1 text-[11px] text-muted-foreground/50 hover:text-foreground rounded-md hover:bg-black/[0.04] dark:hover:bg-white/[0.04] transition-colors"
                             onClick={() => toggleScheduledExport(scheduledExport.id, !scheduledExport.enabled)}
@@ -1984,10 +2031,17 @@ export default function QCEDashboard() {
                             {scheduledExport.enabled ? "禁用" : "启用"}
                           </button>
                           <button
-                            className="px-2 py-1 text-[11px] text-muted-foreground/50 hover:text-foreground rounded-md hover:bg-black/[0.04] dark:hover:bg-white/[0.04] transition-colors"
+                            className="px-2 py-1 text-[11px] text-muted-foreground/50 hover:text-foreground rounded-md hover:bg-black/[0.04] dark:hover:bg-white/[0.04] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                             onClick={() => triggerScheduledExport(scheduledExport.id)}
+                            disabled={isRunning}
                           >
-                            执行
+                            {isRunning ? `${progress?.progress ?? 0}%` : "执行"}
+                          </button>
+                          <button
+                            className="px-2 py-1 text-[11px] text-muted-foreground/50 hover:text-foreground rounded-md hover:bg-black/[0.04] dark:hover:bg-white/[0.04] transition-colors"
+                            onClick={() => handleEditScheduledExport(scheduledExport)}
+                          >
+                            编辑
                           </button>
                           <button
                             className="px-2 py-1 text-[11px] text-muted-foreground/50 hover:text-foreground rounded-md hover:bg-black/[0.04] dark:hover:bg-white/[0.04] transition-colors"
@@ -2009,7 +2063,7 @@ export default function QCEDashboard() {
                           </button>
                         </div>
                       </div>
-                    ))}
+                    )})}
                   </div>
                 )}
               </div>
@@ -2698,11 +2752,16 @@ export default function QCEDashboard() {
         isOpen={isScheduledExportWizardOpen}
         onClose={handleCloseScheduledExportWizard}
         onSubmit={async (form) => {
-          await createScheduledExport(form)
+          if (editingScheduledExportId) {
+            await updateScheduledExportFromForm(editingScheduledExportId, form)
+          } else {
+            await createScheduledExport(form)
+          }
           return true
         }}
         isLoading={scheduledLoading}
         prefilledData={selectedScheduledPreset}
+        isEditing={editingScheduledExportId !== null}
         groups={groups}
         friends={friends}
         onLoadData={loadChatData}

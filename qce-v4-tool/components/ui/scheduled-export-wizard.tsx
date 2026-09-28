@@ -28,6 +28,7 @@ interface ScheduledExportWizardProps {
   groups?: Group[]
   friends?: Friend[]
   onLoadData?: () => void
+  isEditing?: boolean
 }
 
 interface SelectedTarget {
@@ -48,6 +49,7 @@ export function ScheduledExportWizard({
   groups = [],
   friends = [],
   onLoadData,
+  isEditing = false,
 }: ScheduledExportWizardProps) {
   // 基础配置表单
   const [baseForm, setBaseForm] = useState({
@@ -199,7 +201,9 @@ export function ScheduledExportWizard({
     
     for (const target of selectedTargets) {
       const taskForm: CreateScheduledExportForm = {
-        name: baseForm.namePrefix ? `${baseForm.namePrefix}-${target.name}` : target.name,
+        name: isEditing
+          ? (baseForm.namePrefix.trim() || target.name)
+          : (baseForm.namePrefix ? `${baseForm.namePrefix}-${target.name}` : target.name),
         chatType: target.chatType,
         peerUid: target.peerUid,
         sessionName: target.name,
@@ -225,7 +229,7 @@ export function ScheduledExportWizard({
         const success = await onSubmit(taskForm)
         if (success) successCount++
       } catch (error) {
-        console.error(`创建定时任务失败: ${target.name}`, error)
+        console.error(`${isEditing ? '更新' : '创建'}定时任务失败: ${target.name}`, error)
       }
     }
     
@@ -234,7 +238,7 @@ export function ScheduledExportWizard({
     }
   }
 
-  const canSubmit = () => selectedTargets.length > 0 && (baseForm.namePrefix.trim() !== "" || selectedTargets.length === 1)
+  const canSubmit = () => selectedTargets.length > 0 && (isEditing || baseForm.namePrefix.trim() !== "" || selectedTargets.length === 1)
 
   // 搜索处理
   const handleSearchInput = useCallback((value: string) => {
@@ -357,7 +361,7 @@ export function ScheduledExportWizard({
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Package className="w-5 h-5" />
-            批量创建定时导出任务
+            {isEditing ? "编辑定时导出任务" : "批量创建定时导出任务"}
           </DialogTitle>
         </DialogHeader>
 
@@ -365,8 +369,8 @@ export function ScheduledExportWizard({
           {/* 左侧 - 目标选择 */}
           <div className="w-2/5 flex flex-col">
             <div className="mb-4">
-              <h3 className="text-base font-medium mb-1 text-foreground">选择导出目标</h3>
-              <p className="text-sm text-muted-foreground">选择要创建定时任务的群组或好友</p>
+              <h3 className="text-base font-medium mb-1 text-foreground">{isEditing ? "导出目标" : "选择导出目标"}</h3>
+              <p className="text-sm text-muted-foreground">{isEditing ? "编辑时保持原任务的聊天对象" : "选择要创建定时任务的群组或好友"}</p>
             </div>
             
             {showTargetSelector ? (
@@ -637,7 +641,7 @@ export function ScheduledExportWizard({
             <div className="flex-1 overflow-y-auto pr-1 space-y-6">
               {/* 任务名称前缀 */}
               <div className="space-y-2">
-                <Label htmlFor="namePrefix">任务名称前缀（可选）</Label>
+                <Label htmlFor="namePrefix">{isEditing ? "任务名称" : "任务名称前缀（可选）"}</Label>
                 <Input
                   id="namePrefix"
                   placeholder="例如：每日备份"
@@ -646,7 +650,9 @@ export function ScheduledExportWizard({
                   className="rounded-xl"
                 />
                 <p className="text-xs text-muted-foreground">
-                  {selectedTargets.length > 1 
+                  {isEditing
+                    ? "修改当前定时任务的显示名称"
+                    : selectedTargets.length > 1
                     ? `将为每个会话创建任务，格式：${baseForm.namePrefix || "任务名称"}-会话名称`
                     : "留空则使用会话名称作为任务名称"
                   }
@@ -974,7 +980,7 @@ export function ScheduledExportWizard({
             {canSubmit() ? (
               <span className="text-green-600 dark:text-green-400 flex items-center gap-2">
                 <CheckCircle className="w-4 h-4" />
-                准备就绪，将为 {selectedTargets.length} 个会话创建定时任务
+                {isEditing ? "准备就绪，可以保存修改" : `准备就绪，将为 ${selectedTargets.length} 个会话创建定时任务`}
               </span>
             ) : (
               <span className="flex items-center gap-2">
@@ -996,12 +1002,12 @@ export function ScheduledExportWizard({
               {isLoading ? (
                 <>
                   <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                  创建中...
+                  {isEditing ? "保存中..." : "创建中..."}
                 </>
               ) : (
                 <>
                   <Play className="w-4 h-4 mr-2" />
-                  批量创建任务
+                  {isEditing ? "保存修改" : "批量创建任务"}
                 </>
               )}
             </Button>

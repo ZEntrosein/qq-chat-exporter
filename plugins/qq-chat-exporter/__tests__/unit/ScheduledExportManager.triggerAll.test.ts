@@ -95,3 +95,28 @@ test('a failing task does not abort the rest of the queue (#445)', async () => {
     await flush();
     assert.deepEqual(executed.sort(), ['a', 'b'], 'both tasks should run even if the first throws');
 });
+
+test('manual trigger returns immediately and refuses a duplicate execution', async () => {
+    const mgr = newManager();
+    const task = makeTask('a', true);
+    let resolveExecution!: () => void;
+    const executionGate = new Promise<void>((resolve) => { resolveExecution = resolve; });
+    let executions = 0;
+    (mgr as any).executeExportTask = async () => {
+        executions++;
+        await executionGate;
+        return { id: 'h', scheduledExportId: task.id, executedAt: new Date(), status: 'success', duration: 1 };
+    };
+    (mgr as any).scheduledTasks = new Map([['a', task]]);
+
+    const first = mgr.triggerScheduledExport('a');
+    const duplicate = mgr.triggerScheduledExport('a');
+
+    assert.equal(first?.started, true);
+    assert.equal(duplicate?.started, false);
+    assert.equal(executions, 1);
+    assert.ok(['queued', 'running'].includes(mgr.getExecutionProgress('a')?.status || ''));
+
+    resolveExecution();
+    await (mgr as any).runningTasks.get('a');
+});

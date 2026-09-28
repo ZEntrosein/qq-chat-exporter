@@ -8,6 +8,23 @@ import { ScheduledExportManager, type ScheduledExportConfig } from '../../lib/co
 import { BatchMessageFetcher } from '../../lib/core/fetcher/BatchMessageFetcher.js';
 import { ModernHtmlExporter } from '../../lib/core/exporter/ModernHtmlExporter.js';
 
+function listCentralDirectoryEntries(zipPath: string): string[] {
+    const data = fs.readFileSync(zipPath);
+    const entries: string[] = [];
+    for (let offset = 0; offset + 46 <= data.length;) {
+        if (data.readUInt32LE(offset) !== 0x02014b50) {
+            offset++;
+            continue;
+        }
+        const nameLength = data.readUInt16LE(offset + 28);
+        const extraLength = data.readUInt16LE(offset + 30);
+        const commentLength = data.readUInt16LE(offset + 32);
+        entries.push(data.subarray(offset + 46, offset + 46 + nameLength).toString('utf8'));
+        offset += 46 + nameLength + extraLength + commentLength;
+    }
+    return entries;
+}
+
 test('HTML scheduled export creates an isolated ZIP and removes its staging directory', async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qce-scheduled-zip-'));
     const originalFetch = BatchMessageFetcher.prototype.fetchAllMessagesInTimeRange;
@@ -24,7 +41,8 @@ test('HTML scheduled export creates an isolated ZIP and removes its staging dire
             fs.mkdirSync(path.dirname(imagePath), { recursive: true });
             fs.writeFileSync(outputPath, '<html><img src="resources/images/test.png"></html>');
             fs.writeFileSync(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
-            return ['resources/images/test.png'];
+            // 同一个媒体被两条消息引用时，导出器可能返回重复路径。
+            return ['resources/images/test.png', 'resources/images/test.png'];
         };
 
         const dbManager = {
@@ -63,6 +81,8 @@ test('HTML scheduled export creates an isolated ZIP and removes its staging dire
         assert.match(history.filePath, /\.zip$/i);
         assert.ok(fs.existsSync(history.filePath));
         assert.ok(fs.statSync(history.filePath).size > 0);
+        const entries = listCentralDirectoryEntries(history.filePath);
+        assert.equal(entries.filter((entry) => entry === 'resources/images/test.png').length, 1);
         assert.equal(fs.existsSync(path.join(tempDir, '.qce-scheduled-staging')), false);
         assert.equal(fs.readdirSync(tempDir).filter((name) => name.endsWith('.html')).length, 0);
     } finally {

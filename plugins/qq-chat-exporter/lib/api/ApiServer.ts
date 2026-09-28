@@ -2945,13 +2945,27 @@ export class QQChatExporterApiServer {
         this.app.post('/api/scheduled-exports/:id/trigger', async (req, res) => {
             try {
                 const { id } = req.params;
-                const result = await this.scheduledExportManager.triggerScheduledExport(id);
+                const result = this.scheduledExportManager.triggerScheduledExport(id);
                 
                 if (!result) {
                     throw new SystemError(ErrorType.VALIDATION_ERROR, '定时导出任务不存在', 'SCHEDULED_EXPORT_NOT_FOUND');
                 }
 
                 this.sendSuccessResponse(res, result, (req as any).requestId);
+            } catch (error) {
+                this.sendErrorResponse(res, error, (req as any).requestId);
+            }
+        });
+
+        // 查询手动/定时执行的当前进度（内存状态，不改变历史记录格式）
+        this.app.get('/api/scheduled-exports/:id/progress', async (req, res) => {
+            try {
+                const { id } = req.params;
+                const progress = this.scheduledExportManager.getExecutionProgress(id);
+                if (!progress) {
+                    throw new SystemError(ErrorType.VALIDATION_ERROR, '定时导出任务不存在', 'SCHEDULED_EXPORT_NOT_FOUND');
+                }
+                this.sendSuccessResponse(res, progress, (req as any).requestId);
             } catch (error) {
                 this.sendErrorResponse(res, error, (req as any).requestId);
             }

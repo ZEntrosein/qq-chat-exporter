@@ -69,9 +69,29 @@ export class ZipExporter {
 
                 // 添加指定的资源文件
                 if (resourcePaths.length > 0) {
-                    for (const resourcePath of resourcePaths) {
-                        const absolutePath = path.join(htmlDir, resourcePath);
-                        if (fs.existsSync(absolutePath)) {
+                    // 同一个媒体可能被多条消息引用，导出器会多次返回相同路径。
+                    // ZIP 中同名 entry 会让解压软件提示“文件已存在”，因此在最终写入边界统一去重。
+                    const seenEntries = new Set<string>();
+                    for (const rawResourcePath of resourcePaths) {
+                        const resourcePath = rawResourcePath
+                            .replace(/\\/g, '/')
+                            .replace(/^\.\/+/, '');
+                        if (!resourcePath || path.posix.isAbsolute(resourcePath) || resourcePath.split('/').includes('..')) {
+                            continue;
+                        }
+
+                        // Windows 解压目录不区分大小写，大小写不同也视为同一个目标文件。
+                        const entryKey = process.platform === 'win32'
+                            ? resourcePath.toLowerCase()
+                            : resourcePath;
+                        if (seenEntries.has(entryKey)) continue;
+                        seenEntries.add(entryKey);
+
+                        const absolutePath = path.resolve(htmlDir, ...resourcePath.split('/'));
+                        const relativeToHtml = path.relative(htmlDir, absolutePath);
+                        if (relativeToHtml.startsWith('..') || path.isAbsolute(relativeToHtml)) continue;
+
+                        if (fs.existsSync(absolutePath) && fs.statSync(absolutePath).isFile()) {
                             // 使用相对路径作为ZIP内的路径，保持目录结构
                             archive.file(absolutePath, { name: resourcePath });
                         }
