@@ -517,6 +517,87 @@ test('hydrateForwardRecords: 兼容 NapCat parseForward 的 node.data.message �
     }
 });
 
+test('hydrateForwardRecords: 使用 NapCat 位置参数并保留深层转发的 rootMsgId', async () => {
+    const previousBridge = (globalThis as any).__NAPCAT_BRIDGE__;
+    const calls: Array<{ peer: any; rootMsgId: string; parentMsgId: string }> = [];
+    (globalThis as any).__NAPCAT_BRIDGE__ = {
+        core: {
+            apis: {
+                MsgApi: {
+                    async getMultiMsg(peer: any, rootMsgId: string, parentMsgId: string) {
+                        calls.push({ peer, rootMsgId, parentMsgId });
+                        if (rootMsgId === 'root-forward' && parentMsgId === 'root-forward') {
+                            return {
+                                msgList: [rawMessage({
+                                    msgId: 'middle-node',
+                                    peerUid: '',
+                                    elements: [{
+                                        multiForwardMsgElement: {
+                                            resId: 'inner-res-id',
+                                            xmlContent: '<msg><summary>1条转发消息</summary></msg>',
+                                        },
+                                    }],
+                                })],
+                            };
+                        }
+                        if (rootMsgId === 'root-forward' && parentMsgId === 'middle-node') {
+                            return {
+                                msgList: [rawMessage({
+                                    msgId: 'deep-node',
+                                    peerUid: '',
+                                    sendNickName: '深层用户',
+                                    elements: [{ textElement: { content: '原生深层正文' } }],
+                                })],
+                            };
+                        }
+                        return { msgList: [] };
+                    },
+                },
+            },
+        },
+        actions: { get() { return undefined; } },
+    };
+
+    try {
+        const parser = new SimpleMessageParser({ html: 'none' });
+        const top = rawMessage({
+            msgId: 'root-forward',
+            peerUid: 'real-group-peer',
+            records: [],
+            elements: [{
+                multiForwardMsgElement: {
+                    resId: 'outer-res-id',
+                    xmlContent: '<msg><summary>1条转发消息</summary></msg>',
+                },
+            }],
+        });
+
+        const hydrated = await parser.hydrateForwardRecords([top]);
+        assert.equal(hydrated, 2);
+        assert.deepEqual(calls.map(call => ({
+            peerUid: call.peer.peerUid,
+            rootMsgId: call.rootMsgId,
+            parentMsgId: call.parentMsgId,
+        })), [
+            { peerUid: 'real-group-peer', rootMsgId: 'root-forward', parentMsgId: 'root-forward' },
+            { peerUid: 'real-group-peer', rootMsgId: 'root-forward', parentMsgId: 'middle-node' },
+        ]);
+        assert.equal(top.records[0].records[0].elements[0].textElement.content, '原生深层正文');
+
+        const [parsed] = await parser.parseMessages([top]);
+        const outer = parsed.content.elements.find(element => element.type === 'forward')!.data;
+        const nested = outer.messages[0].content.elements.find((element: any) => element.type === 'forward');
+        assert.equal(nested.data.messages[0].content.text, '原生深层正文');
+        assert.doesNotMatch(nested.data.messages[0].content.text, /\[空消息\]/);
+    } finally {
+        if (previousBridge === undefined) {
+            delete (globalThis as any).__NAPCAT_BRIDGE__;
+        } else {
+            (globalThis as any).__NAPCAT_BRIDGE__ = previousBridge;
+        }
+    }
+});
+
 test('hydrateForwardRecords: 相同的转发节点 msgId 使用序号生成独立资源键', async () => {
     const previousBridge = (globalThis as any).__NAPCAT_BRIDGE__;
     (globalThis as any).__NAPCAT_BRIDGE__ = {

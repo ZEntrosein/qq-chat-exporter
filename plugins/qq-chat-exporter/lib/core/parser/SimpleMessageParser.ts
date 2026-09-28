@@ -368,6 +368,7 @@ export class SimpleMessageParser {
         : [];
 
       if (records.length > 0 && forwardElements.length > 0) {
+        records = this.attachForwardFetchContext(records, message);
         records = this.assignForwardResourceKeys(records, message);
         (message as any).records = records;
       }
@@ -402,29 +403,9 @@ export class SimpleMessageParser {
     message: RawMessage,
     resId: string
   ): Promise<RawMessage[]> {
-    try {
-      const bridge = (globalThis as any).__NAPCAT_BRIDGE__;
-      const core = bridge?.core;
-      const msgApi = core?.apis?.MsgApi || core?.apis?.msg;
-      if (msgApi && typeof msgApi.getMultiMsg === 'function') {
-        const peer = {
-          chatType: message.chatType,
-          peerUid: message.peerUid,
-          guildId: ''
-        };
-        const result = await msgApi.getMultiMsg({
-          peer,
-          rootMsgId: message.msgId,
-          parentMsgId: message.msgId,
-          forwardId: resId,
-          resId
-        });
-        if (result && Array.isArray(result.msgList) && result.msgList.length > 0) {
-          return this.assignForwardResourceKeys(result.msgList.filter(Boolean), message);
-        }
-      }
-    } catch {
-      // 继续尝试 OneBot get_forward_msg。
+    const nativeMessages = await this.fetchNativeForwardRawMessages(message, resId);
+    if (nativeMessages.length > 0) {
+      return this.assignForwardResourceKeys(nativeMessages, message);
     }
 
     const bridge = (globalThis as any).__NAPCAT_BRIDGE__;
@@ -446,6 +427,87 @@ export class SimpleMessageParser {
       }
     }
     return [];
+  }
+
+  /**
+   * 调用 NapCat 原生 getMultiMsg，并保存深层转发继续取数所需的根消息上下文。
+   *
+   * 当前 Framework 的真实签名是 getMultiMsg(peer, rootMsgId, parentMsgId)。
+   * 一些旧适配层/测试桩接受单个参数对象，因此位置参数失败或返回空列表时再兼容旧签名。
+   */
+  private async fetchNativeForwardRawMessages(
+    message: RawMessage,
+    resId: string
+  ): Promise<RawMessage[]> {
+    const bridge = (globalThis as any).__NAPCAT_BRIDGE__;
+    const core = bridge?.core;
+    const msgApi = core?.apis?.MsgApi || core?.apis?.msg;
+    if (!msgApi || typeof msgApi.getMultiMsg !== 'function') return [];
+
+    const context = this.getForwardFetchContext(message);
+    let result: any;
+
+    try {
+      result = await msgApi.getMultiMsg(
+        context.peer,
+        context.rootMsgId,
+        context.parentMsgId
+      );
+    } catch {
+      result = undefined;
+    }
+
+    if (!Array.isArray(result?.msgList) || result.msgList.length === 0) {
+      try {
+        result = await msgApi.getMultiMsg({
+          peer: context.peer,
+          rootMsgId: context.rootMsgId,
+          parentMsgId: context.parentMsgId,
+          forwardId: resId,
+          resId
+        });
+      } catch {
+        result = undefined;
+      }
+    }
+
+    if (!Array.isArray(result?.msgList) || result.msgList.length === 0) return [];
+    return this.attachForwardFetchContext(result.msgList.filter(Boolean), message);
+  }
+
+  private getForwardFetchContext(message: RawMessage): {
+    peer: { chatType: number; peerUid: string; guildId: string };
+    rootMsgId: string;
+    parentMsgId: string;
+  } {
+    const internalPeer = (message as any).__qceForwardPeer;
+    const parentPeer = (message as any).parentMsgPeer;
+    const peer = {
+      chatType: Number(internalPeer?.chatType ?? parentPeer?.chatType ?? message.chatType ?? 0),
+      peerUid: String(internalPeer?.peerUid ?? parentPeer?.peerUid ?? message.peerUid ?? ''),
+      guildId: String(internalPeer?.guildId ?? parentPeer?.guildId ?? message.guildId ?? '')
+    };
+    const parentIds = Array.isArray((message as any).parentMsgIdList)
+      ? (message as any).parentMsgIdList.map(String).filter(Boolean)
+      : [];
+    const rootMsgId = String(
+      (message as any).__qceForwardRootMsgId || parentIds[0] || message.msgId || ''
+    );
+    return {
+      peer,
+      rootMsgId,
+      parentMsgId: String(message.msgId || rootMsgId)
+    };
+  }
+
+  private attachForwardFetchContext(records: RawMessage[], parent: RawMessage): RawMessage[] {
+    const context = this.getForwardFetchContext(parent);
+    for (const record of records) {
+      if (!record || typeof record !== 'object') continue;
+      (record as any).__qceForwardRootMsgId = context.rootMsgId;
+      (record as any).__qceForwardPeer = context.peer;
+    }
+    return records;
   }
 
   /**
@@ -1649,30 +1711,7 @@ export class SimpleMessageParser {
     }
 
     if (raws.length === 0) {
-      try {
-        const bridge = (globalThis as any).__NAPCAT_BRIDGE__;
-        const core = bridge?.core;
-        const msgApi = core?.apis?.MsgApi || core?.apis?.msg;
-        if (msgApi && typeof msgApi.getMultiMsg === 'function') {
-          const peer = {
-            chatType: message.chatType,
-            peerUid: message.peerUid,
-            guildId: ''
-          };
-          const result = await msgApi.getMultiMsg({
-            peer,
-            rootMsgId: message.msgId,
-            parentMsgId: message.msgId,
-            forwardId: resId,
-            resId
-          });
-          if (result && Array.isArray(result.msgList)) {
-            raws = result.msgList;
-          }
-        }
-      } catch {
-        // 拉取失败时只能丢掉子消息，外层卡片仍然会给出 [转发消息: N条] 占位。
-      }
+      raws = await this.fetchNativeForwardRawMessages(message, resId);
     }
 
     if (raws.length === 0) {
