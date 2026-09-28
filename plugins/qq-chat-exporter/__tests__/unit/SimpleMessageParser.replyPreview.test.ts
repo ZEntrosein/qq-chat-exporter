@@ -147,3 +147,115 @@ test('backfillReplyPreviewLocalPaths: 原消息没图片资源时不动 reply', 
     const previewElements = (reply.content.elements[0]!.data as any).previewElements;
     assert.equal(previewElements[0].localPath, undefined);
 });
+
+function rawMessage(overrides: Record<string, unknown>): any {
+    return {
+        msgId: '1',
+        msgSeq: '1',
+        clientSeq: '1',
+        msgTime: '1700000000',
+        msgType: 2,
+        chatType: 2,
+        peerUid: 'group',
+        senderUid: 'u_1',
+        senderUin: '10001',
+        sendNickName: '测试用户',
+        recallTime: '0',
+        elements: [],
+        records: [],
+        ...overrides,
+    };
+}
+
+test('parseMessagesStream: 用 replayMsgSeq 定位真正的顶层消息并回填本地缩略图', async () => {
+    const parser = new SimpleMessageParser({ html: 'none' });
+    const source = rawMessage({
+        msgId: 'source-id',
+        msgSeq: '5238907',
+        elements: [{ picElement: { md5HexStr: 'image-md5', fileName: 'source.jpg' } }],
+    });
+    const record = rawMessage({
+        msgId: 'record-id',
+        msgSeq: '5238907',
+        elements: [{ picElement: { md5HexStr: 'image-md5', fileName: 'source.jpg' } }],
+    });
+    const reply = rawMessage({
+        msgId: 'reply-id',
+        msgSeq: '5238910',
+        records: [record],
+        elements: [{
+            replyElement: {
+                replayMsgId: '0',
+                replayMsgSeq: '5238907',
+                sourceMsgIdInRecords: 'record-id',
+                senderUin: '10001',
+            },
+        }],
+    });
+    const resourceMap = new Map([
+        ['source-id', [{ type: 'image', md5: 'image-md5', localPath: process.execPath, accessible: true }]],
+    ]);
+
+    const parsed: CleanMessage[] = [];
+    for await (const message of parser.parseMessagesStream([source, reply], resourceMap)) parsed.push(message);
+    const replyData = parsed[1]!.content.elements.find(element => element.type === 'reply')!.data;
+
+    assert.equal(replyData.referencedMessageId, 'source-id');
+    assert.equal(replyData.sourceAvailable, true);
+    assert.equal(replyData.previewResourceMessageId, 'source-id');
+    assert.equal(replyData.previewElements[0].localPath, `images/${process.platform === 'win32' ? 'node.exe' : 'node'}`);
+});
+
+test('parseMessagesStream: 范围外引用使用 record 媒体，但不生成无效跳转目标', async () => {
+    const parser = new SimpleMessageParser({ html: 'none' });
+    const record = rawMessage({
+        msgId: 'record-id',
+        msgSeq: '5238800',
+        elements: [{ picElement: { md5HexStr: 'record-md5', fileName: 'record.jpg' } }],
+    });
+    const reply = rawMessage({
+        msgId: 'reply-id',
+        msgSeq: '5238910',
+        records: [record],
+        elements: [{
+            replyElement: {
+                replayMsgId: '0',
+                replayMsgSeq: '5238800',
+                sourceMsgIdInRecords: 'record-id',
+                senderUin: '10001',
+            },
+        }],
+    });
+    const resourceMap = new Map([
+        ['record-id', [{ type: 'image', md5: 'record-md5', localPath: process.execPath, accessible: true }]],
+    ]);
+
+    const parsed: CleanMessage[] = [];
+    for await (const message of parser.parseMessagesStream([reply], resourceMap)) parsed.push(message);
+    const replyData = parsed[0]!.content.elements.find(element => element.type === 'reply')!.data;
+
+    assert.equal(replyData.referencedMessageId, undefined);
+    assert.equal(replyData.sourceAvailable, false);
+    assert.equal(replyData.previewResourceMessageId, 'record-id');
+    assert.equal(replyData.previewElements[0].localPath, `images/${process.platform === 'win32' ? 'node.exe' : 'node'}`);
+});
+
+test('backfillReplyPreviewLocalPathsFromResourceMap: 下载失败的计划路径不写入 HTML 数据', () => {
+    const parser = new SimpleMessageParser({ html: 'none' });
+    const reply = makeReplyMessage('101', '100', [
+        { type: 'image', text: '[图片]', md5: 'failed-md5', originUrl: 'http://q.qq/fallback' },
+    ]);
+    (reply.content.elements[0]!.data as any).previewResourceMessageId = 'record-id';
+    parser.backfillReplyPreviewLocalPathsFromResourceMap(reply, new Map([
+        ['record-id', [{
+            type: 'image',
+            md5: 'failed-md5',
+            localPath: 'C:\\cache\\missing.jpg',
+            accessible: false,
+        }]],
+    ]));
+
+    const preview = (reply.content.elements[0]!.data as any).previewElements[0];
+    assert.equal(preview.localPath, undefined);
+    assert.equal(preview.originUrl, 'http://q.qq/fallback');
+});

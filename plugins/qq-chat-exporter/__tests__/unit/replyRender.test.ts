@@ -38,6 +38,16 @@ test('chooseReplyJumpTarget: 全是 0 / 空，返回 null', () => {
     );
 });
 
+test('chooseReplyJumpTarget: 原消息不在导出范围时不使用 records 快照 id', () => {
+    assert.equal(
+        chooseReplyJumpTarget({
+            sourceAvailable: false,
+            msgId: '7000000003',
+        }),
+        null,
+    );
+});
+
 test('chooseReplyJumpTarget: 空对象 / null / undefined 全都安全', () => {
     assert.equal(chooseReplyJumpTarget({}), null);
     assert.equal(chooseReplyJumpTarget(null), null);

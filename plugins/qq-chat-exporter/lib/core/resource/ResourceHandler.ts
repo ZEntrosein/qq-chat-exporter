@@ -460,10 +460,25 @@ export class ResourceHandler {
             failedSamples: [],
         };
 
-        for (const message of messages) {
+        // reply records 是 QQ 附在引用消息上的原内容快照。它们可能引用了导出
+        // 时间范围之外的消息；也要纳入资源扫描，离线 HTML 才能显示引用缩略图。
+        const messagesWithRecords: RawMessage[] = [];
+        const seenMessageIds = new Set<string>();
+        const pending = [...messages];
+        for (let cursor = 0; cursor < pending.length; cursor++) {
+            const message = pending[cursor];
+            if (!message) continue;
+            const key = String(message.msgId || '');
+            if (key && seenMessageIds.has(key)) continue;
+            if (key) seenMessageIds.add(key);
+            messagesWithRecords.push(message);
+            if (Array.isArray(message.records)) pending.push(...message.records);
+        }
+
+        for (const message of messagesWithRecords) {
             const resources: ResourceInfo[] = [];
 
-            for (const element of message.elements) {
+            for (const element of message.elements || []) {
                 if (this.isMediaElement(element)) {
                     try {
                         const resourceInfo = await this.processElement(message, element);

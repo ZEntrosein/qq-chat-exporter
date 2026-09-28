@@ -890,6 +890,20 @@ export class ModernHtmlExporter {
             for (const el of c.elements as any[]) {
                 const data = el?.data;
                 const elType = el?.type || 'file';
+
+                // reply 卡片中的图片可能来自 records 快照，不会出现在当前顶层
+                // 消息的 resources 中，需要显式纳入复制/内联队列。
+                if (elType === 'reply' && Array.isArray(data?.previewElements)) {
+                    for (const preview of data.previewElements) {
+                        if (preview?.type !== 'image' || !preview?.localPath || !this.isValidResourcePath(preview.localPath)) continue;
+                        yield {
+                            type: 'image',
+                            fileName: path.basename(preview.localPath),
+                            localPath: preview.localPath,
+                            url: preview.originUrl
+                        };
+                    }
+                }
                 
                 // 优先使用有效的 localPath
                 if (data && typeof data === 'object' && data.localPath && this.isValidResourcePath(data.localPath)) {
@@ -1673,8 +1687,12 @@ export class ModernHtmlExporter {
         const onClick = jumpTarget
             ? `onclick="scrollToMessage('msg-${this.escapeHtml(jumpTarget)}')"`
             : '';
+        const keyboardAttrs = jumpTarget
+            ? `role="button" tabindex="0" title="点击跳转到原消息" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();scrollToMessage('msg-${this.escapeHtml(jumpTarget)}')}"`
+            : '';
+        const replyClass = jumpTarget ? 'reply-content reply-content-clickable' : 'reply-content';
 
-        return `<div class="reply-content" ${dataAttr} ${onClick}>
+        return `<div class="${replyClass}" ${dataAttr} ${onClick} ${keyboardAttrs}>
             <div class="reply-content-header">
                 <strong>${this.escapeHtml(senderName)}</strong>
                 ${timeStr ? `<span class="reply-content-time">${this.escapeHtml(timeStr)}</span>` : ''}

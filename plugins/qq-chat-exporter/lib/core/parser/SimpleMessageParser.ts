@@ -318,6 +318,12 @@ export class SimpleMessageParser {
   // 全局消息映射，用于查找被引用的消息
   private messageMap: Map<string, RawMessage> = new Map();
 
+  // 只有顶层消息才会被渲染成带 id 的 DOM 节点。records 里的 msgId 是
+  // 引用卡片附带的快照 id，不能拿来做页面跳转。
+  private exportedMessageIds: Set<string> = new Set();
+  private messageBySeq: Map<string, RawMessage> = new Map();
+  private messageByClientSeq: Map<string, RawMessage> = new Map();
+
   // 发件人显示信息缓存：senderUid / senderUin → { groupCard, remark, nickname }
   // 用于在某条消息缺失全部昵称字段时，回退到同一发件人在其他消息上出现过的可读名字。
   private senderInfoCache: Map<string, {
@@ -343,24 +349,8 @@ export class SimpleMessageParser {
     const total = messages.length;
     let processed = 0;
 
-    // 先建立全局消息映射
-    this.messageMap.clear();
-    this.senderInfoCache.clear();
-    for (const msg of messages) {
-      if (msg && msg.msgId) {
-        this.messageMap.set(msg.msgId, msg);
-        this.cacheSenderInfo(msg);
-        // 同时将 records 数组中的消息也添加到映射中
-        if (msg.records && msg.records.length > 0) {
-          for (const record of msg.records) {
-            if (record && record.msgId) {
-              this.messageMap.set(record.msgId, record);
-              this.cacheSenderInfo(record);
-            }
-          }
-        }
-      }
-    }
+    // 先建立全局消息映射；reply 解析需要看到整批消息，不能边解析边建索引。
+    this.indexMessages(messages);
 
     const results = await mapLimit(messages, this.concurrency, async (message, idx) => {
       try {
@@ -385,8 +375,7 @@ export class SimpleMessageParser {
     });
     
     // 清理映射
-    this.messageMap.clear();
-    this.senderInfoCache.clear();
+    this.clearMessageIndexes();
 
     return results;
   }
@@ -453,38 +442,69 @@ export class SimpleMessageParser {
     const total = messages.length;
     let processed = 0;
 
-    for (let i = 0; i < messages.length; i++) {
-      const message = messages[i];
-      if (!message) continue; // 跳过undefined元素
-      
-      try {
-        const cleanMessage = await this.parseMessage(message);
+    this.indexMessages(messages);
+    try {
+      for (let i = 0; i < messages.length; i++) {
+        const message = messages[i];
+        if (!message) continue; // 跳过undefined元素
         
-        // 如果提供了resourceMap，立即更新这条消息的资源路径
-        if (resourceMap && resourceMap.has(message.msgId)) {
-          const resources = resourceMap.get(message.msgId);
-          if (resources && cleanMessage.content.elements) {
-            this.updateSingleMessageResourcePaths(cleanMessage, resources);
+        try {
+          const cleanMessage = await this.parseMessage(message);
+
+          // 如果提供了resourceMap，立即更新这条消息及 reply 预览的资源路径。
+          if (resourceMap) {
+            const resources = resourceMap.get(message.msgId);
+            if (resources && cleanMessage.content.elements) {
+              this.updateSingleMessageResourcePaths(cleanMessage, resources);
+            }
+            this.backfillReplyPreviewLocalPathsFromResourceMap(cleanMessage, resourceMap);
           }
-        }
 
-        processed++;
-        if (this.onProgress) {
-          this.onProgress(processed, total);
-        } else if (processed % this.options.progressEvery === 0) {
-          console.log(`[SimpleMessageParser] 已解析 ${processed}/${total}`);
-        }
+          processed++;
+          if (this.onProgress) {
+            this.onProgress(processed, total);
+          } else if (processed % this.options.progressEvery === 0) {
+            console.log(`[SimpleMessageParser] 已解析 ${processed}/${total}`);
+          }
 
-        if (this.options.yieldEvery > 0 && (i + 1) % this.options.yieldEvery === 0) {
-          await yieldToEventLoop();
-        }
+          if (this.options.yieldEvery > 0 && (i + 1) % this.options.yieldEvery === 0) {
+            await yieldToEventLoop();
+          }
 
-        yield cleanMessage;
-      } catch (error) {
-        console.error('解析消息失败:', error, message.msgId);
-        yield this.createErrorMessage(message, error);
+          yield cleanMessage;
+        } catch (error) {
+          console.error('解析消息失败:', error, message.msgId);
+          yield this.createErrorMessage(message, error);
+        }
+      }
+    } finally {
+      this.clearMessageIndexes();
+    }
+  }
+
+  private indexMessages(messages: RawMessage[]): void {
+    this.clearMessageIndexes();
+    for (const msg of messages) {
+      if (!msg || !msg.msgId) continue;
+      this.messageMap.set(String(msg.msgId), msg);
+      this.exportedMessageIds.add(String(msg.msgId));
+      if (msg.msgSeq != null) this.messageBySeq.set(String(msg.msgSeq), msg);
+      if (msg.clientSeq != null) this.messageByClientSeq.set(String(msg.clientSeq), msg);
+      this.cacheSenderInfo(msg);
+      for (const record of msg.records || []) {
+        if (!record?.msgId) continue;
+        this.messageMap.set(String(record.msgId), record);
+        this.cacheSenderInfo(record);
       }
     }
+  }
+
+  private clearMessageIndexes(): void {
+    this.messageMap.clear();
+    this.exportedMessageIds.clear();
+    this.messageBySeq.clear();
+    this.messageByClientSeq.clear();
+    this.senderInfoCache.clear();
   }
 
   /**
@@ -760,6 +780,8 @@ export class SimpleMessageParser {
         data: {
           messageId: replyData.messageId,
           referencedMessageId: replyData.referencedMessageId,  // 被引用消息的实际messageId
+          previewResourceMessageId: replyData.previewResourceMessageId,
+          sourceAvailable: replyData.sourceAvailable,
           senderUin: replyData.senderUin,
           senderName: replyData.senderName,
           content: replyData.content,
@@ -1550,6 +1572,9 @@ export class SimpleMessageParser {
     // issue #128：所有消息的资源路径写完之后，再回头把 reply 元素里的
     // previewElements.localPath 拉齐，让 HTML 导出能直接渲染缩略图。
     this.backfillReplyPreviewLocalPaths(messages);
+    for (const message of messages) {
+      this.backfillReplyPreviewLocalPathsFromResourceMap(message, resourceMap);
+    }
   }
 
   /**
@@ -1592,6 +1617,52 @@ export class SimpleMessageParser {
           if (candidate?.localPath) pe.localPath = candidate.localPath;
           fallbackIdx++;
         }
+      }
+    }
+  }
+
+  /**
+   * 流式导出无法在 CleanMessage 层回看已经 yield 的源消息，因此直接从
+   * ResourceHandler 返回的 msgId → resources 映射回填引用缩略图。这个映射
+   * 同时包含顶层消息和 reply records 快照，所以引用源不在导出时间范围内时
+   * 也仍能使用本地缩略图。
+   */
+  public backfillReplyPreviewLocalPathsFromResourceMap(
+    message: CleanMessage,
+    resourceMap: Map<string, any[]>
+  ): void {
+    for (const el of message.content.elements) {
+      if (el.type !== 'reply' || !el.data || typeof el.data !== 'object') continue;
+      const data = el.data as {
+        referencedMessageId?: string;
+        previewResourceMessageId?: string;
+        messageId?: string;
+        previewElements?: ReplyPreviewElement[];
+      };
+      if (!Array.isArray(data.previewElements)) continue;
+      const resourceKey = [data.previewResourceMessageId, data.referencedMessageId, data.messageId]
+        .map(value => value == null ? '' : String(value))
+        .find(value => value && resourceMap.has(value));
+      if (!resourceKey) continue;
+      const images = (resourceMap.get(resourceKey) || [])
+        // ResourceHandler 在下载失败时也会保留“计划写入”的 localPath；只有
+        // accessible=true 才代表文件确实存在，避免 HTML 指向 ZIP 中不存在的文件。
+        .filter(resource => resource?.type === 'image'
+          && resource?.localPath
+          && resource?.accessible === true
+          && fs.existsSync(String(resource.localPath)))
+        .map(resource => ({
+          md5: String(resource.md5 || ''),
+          localPath: `images/${path.basename(String(resource.localPath))}`
+        }));
+      if (images.length === 0) continue;
+      let fallbackIdx = 0;
+      for (const preview of data.previewElements) {
+        if (preview.type !== 'image') continue;
+        const byMd5 = preview.md5 ? images.find(image => image.md5 && image.md5 === preview.md5) : undefined;
+        const candidate = byMd5 || images[fallbackIdx];
+        if (candidate) preview.localPath = candidate.localPath;
+        fallbackIdx++;
       }
     }
   }
@@ -1694,52 +1765,46 @@ export class SimpleMessageParser {
   }
 
   private extractReplyContent(replyElement: any, message: RawMessage): any {
-    // 使用 replayMsgId 作为被引用消息的真实ID（但要排除 "0" 的情况）
-    const replayMsgId = replyElement.replayMsgId;
-    let referencedMessageId: string | undefined = (replayMsgId && replayMsgId !== '0') ? replayMsgId : undefined;
-    
-    // sourceMsgIdInRecords 用于内部查找（在 records 数组中）
-    const sourceMsgId = replyElement.sourceMsgIdInRecords;
+    const replayMsgId = replyElement.replayMsgId == null ? '' : String(replyElement.replayMsgId);
+    const sourceMsgId = replyElement.sourceMsgIdInRecords == null ? '' : String(replyElement.sourceMsgIdInRecords);
+    let referencedMessageId: string | undefined;
     let referencedMessage: RawMessage | undefined;
     let source: 'messageMap' | 'records' | 'sourceMsgText' | 'sourceMsgTextElems' | 'referencedMsg' | 'seq' | 'none' = 'none';
     
-    // 1. 尝试用 replayMsgId 从全局消息映射中查找（replayMsgId才是真实被引用消息ID）
-    if (referencedMessageId && this.messageMap.has(referencedMessageId)) {
-      referencedMessage = this.messageMap.get(referencedMessageId);
+    // 1. replayMsgId 只有在它确实属于本次导出的顶层消息时才可作为跳转目标。
+    if (replayMsgId && replayMsgId !== '0' && this.exportedMessageIds.has(replayMsgId)) {
+      referencedMessageId = replayMsgId;
+      referencedMessage = this.messageMap.get(replayMsgId);
       source = 'messageMap';
     }
-    
-    // 2. 如果全局映射中找不到，再从当前消息的 records 数组中查找
-    if (!referencedMessage && sourceMsgId && sourceMsgId !== '0' && message.records && message.records.length > 0) {
-      referencedMessage = message.records.find((record: RawMessage) => record.msgId === sourceMsgId);
-      if (referencedMessage) {
-        referencedMessageId = referencedMessage.msgId;
-        source = 'records';
-      }
-    }
-    
-    // 3. 如果还是找不到，尝试用 replayMsgSeq 匹配 msgSeq
+
+    // 2. NT 数据里的 sourceMsgIdInRecords 通常只是内嵌快照 id；真正源消息
+    // 需要通过 replayMsgSeq / replyMsgClientSeq 在顶层消息中定位。
     if (!referencedMessage && replyElement.replayMsgSeq) {
-      for (const [msgId, msg] of this.messageMap.entries()) {
-        if (msg.msgSeq === replyElement.replayMsgSeq) {
-          referencedMessage = msg;
-          referencedMessageId = msg.msgId;
-          source = 'seq';
-          break;
-        }
+      const bySeq = this.messageBySeq.get(String(replyElement.replayMsgSeq));
+      if (bySeq) {
+        referencedMessage = bySeq;
+        referencedMessageId = String(bySeq.msgId);
+        source = 'seq';
       }
     }
-    
-    // 4. 如果还找不到，尝试用 replyMsgClientSeq 匹配
+
+    // 3. 客户端序号作为次级索引。
     if (!referencedMessage && replyElement.replyMsgClientSeq) {
-      for (const [msgId, msg] of this.messageMap.entries()) {
-        if (msg.clientSeq === replyElement.replyMsgClientSeq) {
-          referencedMessage = msg;
-          referencedMessageId = msg.msgId;
-          source = 'seq';
-          break;
-        }
+      const byClientSeq = this.messageByClientSeq.get(String(replyElement.replyMsgClientSeq));
+      if (byClientSeq) {
+        referencedMessage = byClientSeq;
+        referencedMessageId = String(byClientSeq.msgId);
+        source = 'seq';
       }
+    }
+
+    // 4. 源消息不在导出范围内时，用 records 快照生成文字/缩略图，但绝不
+    // 把 record.msgId 当成 DOM 跳转目标。
+    if (!referencedMessage && sourceMsgId && sourceMsgId !== '0') {
+      referencedMessage = message.records?.find((record: RawMessage) => String(record.msgId) === sourceMsgId)
+        || this.messageMap.get(sourceMsgId);
+      if (referencedMessage) source = 'records';
     }
 
     // #289：被引用消息发件人显示名解析。
@@ -1753,6 +1818,8 @@ export class SimpleMessageParser {
     const result: {
       messageId: string;
       referencedMessageId: string | undefined;
+      previewResourceMessageId: string | undefined;
+      sourceAvailable: boolean;
       senderUin: string;
       senderName: string;
       content: string;
@@ -1760,7 +1827,9 @@ export class SimpleMessageParser {
       previewElements: ReplyPreviewElement[];
     } = {
       messageId: sourceMsgId || replyElement.replayMsgId || replyElement.replayMsgSeq || '0',
-      referencedMessageId: referencedMessageId || undefined,  // 确保不会是 "0"
+      referencedMessageId,
+      previewResourceMessageId: referencedMessage?.msgId ? String(referencedMessage.msgId) : (sourceMsgId || undefined),
+      sourceAvailable: Boolean(referencedMessageId),
       senderUin: replyElement.senderUin || (referencedMessage?.senderUin ?? ''),
       senderName,
       content: '原消息',

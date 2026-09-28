@@ -14,6 +14,8 @@
  */
 
 export interface ReplyRenderInput {
+    /** false 表示原消息不在当前导出中，此时 records 的快照 id 不能用于跳转。 */
+    sourceAvailable?: boolean
     /** SimpleMessageParser 写入的目标消息 id（与 messageMap key 对齐）。 */
     referencedMessageId?: string | null
     /** 历史字段，部分老代码 / 老快照里仍然在用。 */
@@ -34,6 +36,7 @@ export interface ReplyRenderInput {
  */
 export function chooseReplyJumpTarget(data: ReplyRenderInput | null | undefined): string | null {
     if (!data) return null
+    if (data.sourceAvailable === false) return null
     const candidates: Array<unknown> = [data.referencedMessageId, data.replyMsgId, data.msgId]
     for (const raw of candidates) {
         if (raw == null) continue

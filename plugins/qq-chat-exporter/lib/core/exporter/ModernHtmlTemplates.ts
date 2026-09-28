@@ -881,11 +881,16 @@ export const MODERN_CSS = `
             font-size: 13px;
             line-height: 1.5;
             color: var(--text-secondary);
-            cursor: pointer;
+            cursor: default;
             transition: all 0.2s;
         }
         
-        .reply-content:hover {
+        .reply-content-clickable {
+            cursor: pointer;
+        }
+
+        .reply-content-clickable:hover,
+        .reply-content-clickable:focus-visible {
             background: var(--reply-border);
             opacity: 1;
             transform: translateX(2px);
@@ -1539,7 +1544,13 @@ export const MODERN_SINGLE_APP_JS = `
             }
             scrollToIndex(index) {
                 if (typeof index !== 'number' || index < 0) return;
-                var targetOffset = index * (this.options.itemHeight || 100);
+                // 先把目标所在区间同步渲染出来，否则 reply 跳转时目标消息
+                // 很可能还不在 DOM 中，document.getElementById 会直接失败。
+                this.startIndex = Math.max(0, index - this.options.bufferSize);
+                this.endIndex = Math.min(this.allItems.length, index + this.options.bufferSize + 1);
+                this.render();
+                var containerTop = window.pageYOffset + this.container.getBoundingClientRect().top;
+                var targetOffset = containerTop + index * (this.options.itemHeight || 100);
                 window.scrollTo({
                     top: targetOffset,
                     behavior: 'smooth'
@@ -1557,6 +1568,44 @@ export const MODERN_SINGLE_APP_JS = `
             // 回复消息跳转功能
             window.scrollToMessage = function(msgId) {
                 var targetMsg = document.getElementById(msgId);
+                if (!targetMsg && virtualScroller && Array.isArray(virtualScroller.allItems)) {
+                    var targetIndex = virtualScroller.allItems.findIndex(function(block) {
+                        var message = block && block.querySelector ? block.querySelector('.message') : null;
+                        return message && message.id === msgId;
+                    });
+                    if (targetIndex >= 0) {
+                        virtualScroller.scrollToIndex(targetIndex);
+                        targetMsg = document.getElementById(msgId);
+                    }
+                }
+                // 当前搜索 / 发送者 / 日期筛选可能把源消息排除在 DOM 之外。
+                // 若完整消息集合里确实存在目标，清除筛选后重试一次，保证引用
+                // 点击的语义始终是“显示并定位源消息”。
+                if (!targetMsg && Array.isArray(originalMessages)) {
+                    var sourceExists = originalMessages.some(function(block) {
+                        var message = block && block.querySelector ? block.querySelector('.message') : null;
+                        return message && message.id === msgId;
+                    });
+                    var hadActiveFilters = (searchInput && searchInput.value)
+                        || currentFilter !== 'all'
+                        || (startDateInput && startDateInput.value)
+                        || (endDateInput && endDateInput.value);
+                    if (sourceExists && hadActiveFilters && typeof filterMessages === 'function') {
+                        if (searchInput) searchInput.value = '';
+                        currentFilter = 'all';
+                        currentFilterUid = null;
+                        if (startDateInput) startDateInput.value = '';
+                        if (endDateInput) endDateInput.value = '';
+                        if (filterOptionsList) {
+                            filterOptionsList.querySelectorAll('.filter-option').forEach(function(option) {
+                                option.classList.toggle('active', option.getAttribute('data-value') === 'all');
+                            });
+                        }
+                        filterMessages();
+                        setTimeout(function() { window.scrollToMessage(msgId); }, 100);
+                        return;
+                    }
+                }
                 if (targetMsg) {
                     // 平滑滚动到目标消息
                     targetMsg.scrollIntoView({ behavior: 'smooth', block: 'center' });
