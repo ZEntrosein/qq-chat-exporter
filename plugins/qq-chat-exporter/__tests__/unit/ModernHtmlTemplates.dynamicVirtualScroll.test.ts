@@ -12,6 +12,8 @@ class FakeElement {
     public height: number;
     public id: string;
     public isFragment = false;
+    public parentNode: FakeElement | null = null;
+    public layoutMedia: Array<{ complete?: boolean; tagName?: string; readyState?: number }> = [];
     private absoluteTop: number;
 
     constructor(id = '', height = 0, absoluteTop = 0) {
@@ -25,12 +27,44 @@ class FakeElement {
     }
 
     appendChild(child: FakeElement) {
-        if (child.isFragment) this.children.push(...child.children);
-        else this.children.push(child);
+        if (child.isFragment) {
+            child.children.forEach(entry => this.appendChild(entry));
+        } else {
+            child.remove();
+            child.parentNode = this;
+            this.children.push(child);
+        }
         return child;
     }
 
+    insertBefore(child: FakeElement, reference: FakeElement | null) {
+        child.remove();
+        child.parentNode = this;
+        const index = reference ? this.children.indexOf(reference) : -1;
+        if (index < 0) this.children.push(child);
+        else this.children.splice(index, 0, child);
+        return child;
+    }
+
+    remove() {
+        if (!this.parentNode) return;
+        const index = this.parentNode.children.indexOf(this);
+        if (index >= 0) this.parentNode.children.splice(index, 1);
+        this.parentNode = null;
+    }
+
+    get firstChild() {
+        return this.children[0] ?? null;
+    }
+
+    get nextSibling() {
+        if (!this.parentNode) return null;
+        const index = this.parentNode.children.indexOf(this);
+        return this.parentNode.children[index + 1] ?? null;
+    }
+
     set innerHTML(_value: string) {
+        this.children.forEach(child => { child.parentNode = null; });
         this.children = [];
     }
 
@@ -51,7 +85,8 @@ class FakeElement {
         return null;
     }
 
-    querySelectorAll() {
+    querySelectorAll(selector = '') {
+        if (selector.includes('.image-content')) return this.layoutMedia;
         return [];
     }
 
@@ -142,8 +177,6 @@ test('dynamic virtual scroller indexes variable message heights and updates meas
     );
     assert.ok(firstRendered);
     firstRendered.height = 140;
-    // 模拟图片加载完成后，同一消息再次 clone 时也具有新的固有高度。
-    scroller.allItems[0].height = 140;
     scroller.measureRenderedItems();
 
     assert.deepEqual(Array.from(scroller.itemOffsets), [0, 140, 340, 390, 690]);
@@ -186,7 +219,6 @@ test('height changes above the viewport preserve the visible anchor position', (
 
     // 视口上方的第二条增加 40px，页面也应补偿滚动 40px，第三条保持原位。
     secondRendered.height = 240;
-    scroller.allItems[1].height = 240;
     scroller.measureRenderedItems();
 
     assert.equal(windowObject.pageYOffset, 430);
@@ -206,7 +238,6 @@ test('filtering to zero messages clears the rendered virtual window', () => {
 
     assert.equal(scroller.content.children.length, 0);
     assert.equal(scroller.spacer.style.height, '0px');
-    assert.equal(scroller.content.style.transform, 'translateY(0px)');
 });
 
 test('ordinary scrolling inside the buffered window does not rebuild the DOM', () => {
@@ -227,6 +258,41 @@ test('ordinary scrolling inside the buffered window does not rebuild the DOM', (
     scroller.update();
 
     assert.equal(renderCount, 0);
+});
+
+test('window shifts preserve overlapping DOM nodes instead of cloning loaded media again', () => {
+    (globalThis as any).__qceTestPageYOffset = 0;
+    const { VirtualScroller, container, windowObject } = loadVirtualScroller();
+    const items = Array.from({ length: 100 }, (_, index) => item(`msg-${index}`, 100));
+    const scroller = new VirtualScroller(container, items, { itemHeight: 100, bufferSize: 10 });
+    const preserved = scroller.content.children.find(
+        (entry: FakeElement) => entry.getAttribute('data-qce-virtual-index') === '8',
+    );
+    assert.equal(preserved, items[8]);
+
+    // 从初始 0..12 换到约 7..29；8 号仍在重叠区域，节点身份必须不变。
+    windowObject.pageYOffset = 1800;
+    (globalThis as any).__qceTestPageYOffset = 1800;
+    scroller.update();
+
+    const afterShift = scroller.content.children.find(
+        (entry: FakeElement) => entry.getAttribute('data-qce-virtual-index') === '8',
+    );
+    assert.equal(afterShift, preserved);
+});
+
+test('pending media height is not written back as a collapsed cache value', () => {
+    (globalThis as any).__qceTestPageYOffset = 0;
+    const { VirtualScroller, container } = loadVirtualScroller();
+    const mediaItem = item('msg-media', 240);
+    mediaItem.layoutMedia = [{ complete: false, tagName: 'IMG' }];
+    const scroller = new VirtualScroller(container, [mediaItem], { itemHeight: 120, bufferSize: 1 });
+
+    mediaItem.height = 60;
+    scroller.measureRenderedItems();
+
+    assert.equal(scroller.itemHeights[0], 240);
+    assert.equal(scroller.spacer.style.height, '240px');
 });
 
 test('large variable-height lists keep index jumps monotonic and render the target window', () => {

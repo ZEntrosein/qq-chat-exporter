@@ -688,8 +688,16 @@ export const MODERN_CSS = `
             top: 0;
             left: 0;
             width: 100%;
-            will-change: transform;
             overflow-anchor: none;
+        }
+
+        .virtual-scroll-content > .message-block {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            width: 100%;
+            will-change: transform;
         }
         
         /* 加载指示器 */
@@ -1570,35 +1578,70 @@ export const MODERN_SINGLE_APP_JS = `
                 }
             }
 
-            render() {
-                const fragment = document.createDocumentFragment();
-                const offset = this.itemOffsets[this.startIndex] || 0;
-
-                if (this.resizeObserver) this.resizeObserver.disconnect();
-
-                // 批量渲染可见项
-                for (let i = this.startIndex; i < this.endIndex; i++) {
-                    if (this.allItems[i]) {
-                        var clone = this.allItems[i].cloneNode(true);
-                        clone.setAttribute('data-qce-virtual-index', String(i));
-                        fragment.appendChild(clone);
-                    }
-                }
-
-                // 一次性更新DOM
-                this.content.innerHTML = '';
-                this.content.appendChild(fragment);
-                this.content.style.transform = 'translateY(' + offset + 'px)';
-
-                var rendered = Array.from(this.content.children);
-                if (this.resizeObserver) {
-                    rendered.forEach(item => this.resizeObserver.observe(item));
-                }
-                rendered.forEach(item => {
-                    item.querySelectorAll('img').forEach(img => {
-                        if (!img.complete) img.addEventListener('load', () => this.scheduleMeasurement(), { once: true });
-                    });
+            positionRenderedItems() {
+                Array.from(this.content.children).forEach(item => {
+                    var index = Number(item.getAttribute('data-qce-virtual-index'));
+                    if (!Number.isInteger(index) || index < 0 || index >= this.itemOffsets.length - 1) return;
+                    item.style.transform = 'translateY(' + (this.itemOffsets[index] || 0) + 'px)';
                 });
+            }
+
+            watchRenderedItem(item) {
+                if (this.resizeObserver) this.resizeObserver.observe(item);
+                item.querySelectorAll('img').forEach(img => {
+                    if (img.complete || img.__qceHeightListenerAttached) return;
+                    img.__qceHeightListenerAttached = true;
+                    var settled = () => {
+                        img.__qceHeightListenerAttached = false;
+                        this.scheduleMeasurement();
+                    };
+                    img.addEventListener('load', settled, { once: true });
+                    img.addEventListener('error', settled, { once: true });
+                });
+            }
+
+            hasPendingLayoutMedia(item) {
+                return Array.from(item.querySelectorAll(
+                    '.image-content img, .market-face, .reply-content-thumb, video'
+                )).some(media => {
+                    if (media.tagName && media.tagName.toLowerCase() === 'video') {
+                        return media.readyState === 0;
+                    }
+                    return media.complete === false;
+                });
+            }
+
+            render() {
+                var wanted = [];
+                var wantedSet = new Set();
+
+                for (let i = this.startIndex; i < this.endIndex; i++) {
+                    var item = this.allItems[i];
+                    if (!item) continue;
+                    item.setAttribute('data-qce-virtual-index', String(i));
+                    wanted.push(item);
+                    wantedSet.add(item);
+                }
+
+                // 只移除离开缓冲窗口的边缘节点。仍在窗口里的消息复用原 DOM，
+                // 避免图片、视频和头像在每次换窗时重新加载并造成高度塌缩。
+                Array.from(this.content.children).forEach(item => {
+                    if (wantedSet.has(item)) return;
+                    if (this.resizeObserver) this.resizeObserver.unobserve(item);
+                    item.remove();
+                });
+
+                // 保持 DOM 顺序，但移动既有节点时不克隆、不清空容器。
+                var referenceNode = this.content.firstChild;
+                wanted.forEach(item => {
+                    if (item !== referenceNode) {
+                        this.content.insertBefore(item, referenceNode);
+                    }
+                    referenceNode = item.nextSibling;
+                    this.watchRenderedItem(item);
+                });
+
+                this.positionRenderedItems();
                 this.scheduleMeasurement();
 
                 // 重新初始化图标
@@ -1630,6 +1673,9 @@ export const MODERN_SINGLE_APP_JS = `
                 Array.from(this.content.children).forEach(item => {
                     var index = Number(item.getAttribute('data-qce-virtual-index'));
                     if (!Number.isInteger(index) || index < 0 || index >= this.itemHeights.length) return;
+                    // 媒体尚未完成布局时的高度只是临时塌缩值，不能覆盖稳定缓存。
+                    // 节点绝对定位后，这个临时值也不会把其后的消息向上拉动。
+                    if (this.hasPendingLayoutMedia(item)) return;
                     var rect = item.getBoundingClientRect();
                     var style = window.getComputedStyle(item);
                     var marginTop = parseFloat(style.marginTop) || 0;
@@ -1645,7 +1691,7 @@ export const MODERN_SINGLE_APP_JS = `
 
                 if (!changed) return;
                 this.rebuildOffsets();
-                this.content.style.transform = 'translateY(' + (this.itemOffsets[this.startIndex] || 0) + 'px)';
+                this.positionRenderedItems();
 
                 // 高度修正发生在视口上方时，维持当前消息在屏幕中的相对位置。
                 var correctedOffset = (this.itemOffsets[anchorIndex] || 0) + anchorWithin;
@@ -1653,20 +1699,19 @@ export const MODERN_SINGLE_APP_JS = `
                 var delta = targetScrollTop - currentScrollTop;
                 if (Math.abs(delta) > 0.5) window.scrollBy(0, delta);
                 this.scrollTop = window.pageYOffset || document.documentElement.scrollTop || 0;
-                this.startIndex = -1;
-                this.endIndex = -1;
+                // 保留当前窗口和已加载媒体节点。旧实现会在每次高度变化后强制
+                // 完整重建，正是低频但大幅闪动的主要来源。
                 this.update();
             }
 
             updateItems(items) {
+                if (this.resizeObserver) this.resizeObserver.disconnect();
+                this.content.innerHTML = '';
                 this.setItems(items);
                 this.scrollTop = window.pageYOffset || document.documentElement.scrollTop;
                 this.startIndex = -1;
                 this.endIndex = -1;
                 if (this.allItems.length === 0) {
-                    if (this.resizeObserver) this.resizeObserver.disconnect();
-                    this.content.innerHTML = '';
-                    this.content.style.transform = 'translateY(0px)';
                     this.startIndex = 0;
                     this.endIndex = 0;
                     return;
@@ -1910,7 +1955,12 @@ export const MODERN_SINGLE_APP_JS = `
             // issue #467：导出时可通过 window.__QCE_ENABLE_VIRTUAL_SCROLL=false 关闭，
             // 让所有消息留在 DOM 中，便于打印 / 导出 PDF（默认仍启用）。
             var virtualScroller = null;
-            if (window.__QCE_ENABLE_VIRTUAL_SCROLL !== false && messageBlocks.length > 100) {
+            var configuredVirtualThreshold = Number(window.__QCE_VIRTUAL_SCROLL_THRESHOLD);
+            var virtualScrollThreshold = Number.isFinite(configuredVirtualThreshold)
+                && configuredVirtualThreshold >= 100
+                ? configuredVirtualThreshold
+                : 1200;
+            if (window.__QCE_ENABLE_VIRTUAL_SCROLL !== false && messageBlocks.length > virtualScrollThreshold) {
                 var chatContent = document.querySelector('.chat-content');
                 // 页面初次加载时所有消息都还在 DOM，先记录真实外部高度作为动态
                 // 虚拟列表的初值。图片后续加载造成的变化由 ResizeObserver 继续修正。
@@ -1920,11 +1970,12 @@ export const MODERN_SINGLE_APP_JS = `
                     var measuredHeight = rect.height
                         + (parseFloat(style.marginTop) || 0)
                         + (parseFloat(style.marginBottom) || 0);
-                    var clone = block.cloneNode(true);
                     if (Number.isFinite(measuredHeight) && measuredHeight > 0) {
-                        clone.setAttribute('data-qce-virtual-height', String(measuredHeight));
+                        block.setAttribute('data-qce-virtual-height', String(measuredHeight));
                     }
-                    return clone;
+                    // 直接复用初始 DOM。cloneNode 会丢掉图片已经加载/解码的状态，
+                    // 后续换窗时重新产生一次 0px -> 实际高度的布局变化。
+                    return block;
                 });
                 chatContent.innerHTML = '';
                 virtualScroller = new VirtualScroller(chatContent, originalBlocks, {

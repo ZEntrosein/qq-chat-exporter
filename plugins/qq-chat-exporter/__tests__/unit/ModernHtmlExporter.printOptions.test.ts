@@ -67,6 +67,7 @@ test('enableVirtualScroll=false disables virtual scrolling (#467)', async () => 
     const html = await renderHtml({ enableVirtualScroll: false });
     assert.ok(html.includes('window.__QCE_ENABLE_VIRTUAL_SCROLL = false'), 'virtual scroll should be disabled');
     // 渲染脚本中的开关判断仍在，只是运行期被关掉。
-    assert.ok(html.includes('window.__QCE_ENABLE_VIRTUAL_SCROLL !== false && messageBlocks.length > 100'),
+    assert.ok(html.includes('window.__QCE_ENABLE_VIRTUAL_SCROLL !== false && messageBlocks.length > virtualScrollThreshold'),
         'virtual scroll init should be gated on the runtime flag');
+    assert.ok(html.includes(': 1200;'), 'normal-sized exports should use native document flow');
 });
