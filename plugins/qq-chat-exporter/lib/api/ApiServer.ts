@@ -2957,7 +2957,49 @@ export class QQChatExporterApiServer {
             }
         });
 
-        // 查询手动/定时执行的当前进度（内存状态，不改变历史记录格式）
+        // 暂停当前执行实例（不禁用后续计划）
+        this.app.post('/api/scheduled-exports/:id/pause', async (req, res) => {
+            try {
+                const { id } = req.params;
+                const result = this.scheduledExportManager.pauseScheduledExport(id);
+                if (!result) {
+                    throw new SystemError(ErrorType.VALIDATION_ERROR, '定时导出任务不存在', 'SCHEDULED_EXPORT_NOT_FOUND');
+                }
+                this.sendSuccessResponse(res, result, (req as any).requestId);
+            } catch (error) {
+                this.sendErrorResponse(res, error, (req as any).requestId);
+            }
+        });
+
+        // 继续一个已暂停的执行实例
+        this.app.post('/api/scheduled-exports/:id/resume', async (req, res) => {
+            try {
+                const { id } = req.params;
+                const result = this.scheduledExportManager.resumeScheduledExport(id);
+                if (!result) {
+                    throw new SystemError(ErrorType.VALIDATION_ERROR, '定时导出任务不存在', 'SCHEDULED_EXPORT_NOT_FOUND');
+                }
+                this.sendSuccessResponse(res, result, (req as any).requestId);
+            } catch (error) {
+                this.sendErrorResponse(res, error, (req as any).requestId);
+            }
+        });
+
+        // 停止本轮执行；任务仍保持启用并会按原计划再次运行
+        this.app.post('/api/scheduled-exports/:id/stop', async (req, res) => {
+            try {
+                const { id } = req.params;
+                const result = this.scheduledExportManager.stopScheduledExportExecution(id);
+                if (!result) {
+                    throw new SystemError(ErrorType.VALIDATION_ERROR, '定时导出任务不存在', 'SCHEDULED_EXPORT_NOT_FOUND');
+                }
+                this.sendSuccessResponse(res, result, (req as any).requestId);
+            } catch (error) {
+                this.sendErrorResponse(res, error, (req as any).requestId);
+            }
+        });
+
+        // 查询手动/定时执行的当前进度（内存状态）
         this.app.get('/api/scheduled-exports/:id/progress', async (req, res) => {
             try {
                 const { id } = req.params;

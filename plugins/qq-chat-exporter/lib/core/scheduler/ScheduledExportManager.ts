@@ -199,7 +199,7 @@ export interface ExecutionHistory {
     /** 执行时间 */
     executedAt: Date;
     /** 执行状态 */
-    status: 'success' | 'failed' | 'partial';
+    status: 'success' | 'failed' | 'partial' | 'stopped';
     /** 消息数量 */
     messageCount?: number;
     /** 文件路径 */
@@ -224,7 +224,7 @@ export interface ExecutionHistory {
     };
 }
 
-export type ScheduledExportProgressStatus = 'idle' | 'queued' | 'running' | 'success' | 'partial' | 'failed';
+export type ScheduledExportProgressStatus = 'idle' | 'queued' | 'running' | 'paused' | 'stopping' | 'stopped' | 'success' | 'partial' | 'failed';
 
 /** 最近一次执行的轻量进度；仅保存在内存中，不改变现有数据库格式。 */
 export interface ScheduledExportProgress {
@@ -236,6 +236,26 @@ export interface ScheduledExportProgress {
     startedAt?: string;
     updatedAt: string;
     historyId?: string;
+}
+
+type ScheduledExecutionState = 'running' | 'paused' | 'stopping';
+
+interface ScheduledExecutionControl {
+    state: ScheduledExecutionState;
+    fetcher?: BatchMessageFetcher;
+    resumeWaiters: Set<() => void>;
+}
+
+export interface ScheduledExecutionControlResult {
+    changed: boolean;
+    progress: ScheduledExportProgress;
+}
+
+class ScheduledExportStoppedError extends Error {
+    constructor() {
+        super('本轮定时导出已停止');
+        this.name = 'ScheduledExportStoppedError';
+    }
 }
 
 /**
@@ -251,6 +271,7 @@ export class ScheduledExportManager {
     private executionHistory: Map<string, ExecutionHistory[]> = new Map();
     private runningTasks: Map<string, Promise<ExecutionHistory>> = new Map();
     private executionProgress: Map<string, ScheduledExportProgress> = new Map();
+    private executionControls: Map<string, ScheduledExecutionControl> = new Map();
     
     constructor(core: NapCatCore, dbManager: DatabaseManager, resourceHandler: ResourceHandler) {
         this.core = core;
@@ -388,6 +409,63 @@ export class ScheduledExportManager {
             message: '等待执行',
             updatedAt: new Date().toISOString()
         };
+    }
+
+    /** 暂停当前执行实例；不会禁用任务，也不会影响下一次 cron 调度。 */
+    pauseScheduledExport(id: string): ScheduledExecutionControlResult | null {
+        if (!this.scheduledTasks.has(id)) return null;
+        const control = this.executionControls.get(id);
+        const progress = this.getExecutionProgress(id)!;
+        if (!control || control.state !== 'running' || !['queued', 'running'].includes(progress.status)) {
+            return { changed: false, progress };
+        }
+
+        control.state = 'paused';
+        this.updateExecutionProgress(id, {
+            status: 'paused',
+            message: `已暂停：${progress.message}`
+        });
+        return { changed: true, progress: this.getExecutionProgress(id)! };
+    }
+
+    /** 继续一个已暂停的执行实例。 */
+    resumeScheduledExport(id: string): ScheduledExecutionControlResult | null {
+        if (!this.scheduledTasks.has(id)) return null;
+        const control = this.executionControls.get(id);
+        const progress = this.getExecutionProgress(id)!;
+        if (!control || control.state !== 'paused') {
+            return { changed: false, progress };
+        }
+
+        control.state = 'running';
+        this.releaseExecutionWaiters(control);
+        this.updateExecutionProgress(id, {
+            status: 'running',
+            message: progress.message.replace(/^已暂停：/, '已继续：')
+        });
+        return { changed: true, progress: this.getExecutionProgress(id)! };
+    }
+
+    /**
+     * 停止当前执行实例。停止是本轮级操作：任务配置与后续 cron 调度保持不变。
+     * 正在进行的单个 QQ / 文件系统调用无法强行打断，会在最近的安全检查点结束。
+     */
+    stopScheduledExportExecution(id: string): ScheduledExecutionControlResult | null {
+        if (!this.scheduledTasks.has(id)) return null;
+        const control = this.executionControls.get(id);
+        const progress = this.getExecutionProgress(id)!;
+        if (!control || control.state === 'stopping' || !['queued', 'running', 'paused'].includes(progress.status)) {
+            return { changed: false, progress };
+        }
+
+        control.state = 'stopping';
+        control.fetcher?.cancel();
+        this.releaseExecutionWaiters(control);
+        this.updateExecutionProgress(id, {
+            status: 'stopping',
+            message: '正在停止本轮执行…'
+        });
+        return { changed: true, progress: this.getExecutionProgress(id)! };
     }
 
     /**
@@ -594,11 +672,48 @@ export class ScheduledExportManager {
             updatedAt: now
         });
 
+        this.executionControls.set(task.id, {
+            state: 'running',
+            resumeWaiters: new Set()
+        });
+
         const execution = this.executeExportTask(task).finally(() => {
             this.runningTasks.delete(task.id);
+            const control = this.executionControls.get(task.id);
+            if (control) this.releaseExecutionWaiters(control);
+            this.executionControls.delete(task.id);
         });
         this.runningTasks.set(task.id, execution);
         return execution;
+    }
+
+    private releaseExecutionWaiters(control: ScheduledExecutionControl): void {
+        for (const resolve of control.resumeWaiters) resolve();
+        control.resumeWaiters.clear();
+    }
+
+    /** 等待暂停解除，并在停止请求到达时以统一异常退出当前执行链。 */
+    private async waitForExecutionCheckpoint(taskId: string): Promise<void> {
+        const control = this.executionControls.get(taskId);
+        if (!control) return;
+
+        while (control.state === 'paused') {
+            await new Promise<void>((resolve) => control.resumeWaiters.add(resolve));
+        }
+        if (control.state === 'stopping') {
+            throw new ScheduledExportStoppedError();
+        }
+    }
+
+    /** 给流式 HTML 解析逐条插入控制点，暂停时不再继续生成后续消息。 */
+    private async *withExecutionCheckpoints<T>(
+        taskId: string,
+        source: AsyncIterable<T>
+    ): AsyncGenerator<T> {
+        for await (const item of source) {
+            await this.waitForExecutionCheckpoint(taskId);
+            yield item;
+        }
     }
 
     private updateExecutionProgress(
@@ -621,6 +736,8 @@ export class ScheduledExportManager {
     private async executeExportTask(task: ScheduledExportConfig): Promise<ExecutionHistory> {
         const startTime = Date.now();
         const historyId = `history_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        const stopCleanupFiles: string[] = [];
+        const stopCleanupDirectories: string[] = [];
         
         const history: ExecutionHistory = {
             id: historyId,
@@ -631,6 +748,7 @@ export class ScheduledExportManager {
         };
 
         try {
+            await this.waitForExecutionCheckpoint(task.id);
             this.updateExecutionProgress(task.id, {
                 status: 'running',
                 progress: 5,
@@ -647,6 +765,8 @@ export class ScheduledExportManager {
                 timeout: 30000,
                 retryCount: 3
             });
+            const executionControl = this.executionControls.get(task.id);
+            if (executionControl) executionControl.fetcher = fetcher;
 
             const allMessages: RawMessage[] = [];
             const messageGenerator = fetcher.fetchAllMessagesInTimeRange(
@@ -656,12 +776,14 @@ export class ScheduledExportManager {
             );
 
             for await (const batch of messageGenerator) {
+                await this.waitForExecutionCheckpoint(task.id);
                 allMessages.push(...batch);
                 this.updateExecutionProgress(task.id, {
                     progress: 20,
                     message: `已读取 ${allMessages.length} 条消息`
                 });
             }
+            await this.waitForExecutionCheckpoint(task.id);
 
             if (allMessages.length === 0) {
                 history.status = 'success';
@@ -706,15 +828,21 @@ export class ScheduledExportManager {
             // 合并转发详情需要额外接口才能取得。必须先写回 records，再让资源
             // 处理器递归扫描，否则详情内媒体只会留下会过期的远程 URL。
             if (task.format.toUpperCase() === 'HTML') {
+                await this.waitForExecutionCheckpoint(task.id);
                 const forwardHydrator = new SimpleMessageParser({ html: 'none' });
                 const hydratedForwardCount = await forwardHydrator.hydrateForwardRecords(allMessages);
                 if (hydratedForwardCount > 0) {
                     console.info(`[ScheduledExport] 已预取 ${hydratedForwardCount} 条合并转发详情`);
                 }
             }
+            await this.waitForExecutionCheckpoint(task.id);
 
             // 下载资源（受 skipDownloadResourceTypes 影响）
-            const resourceMap = await this.resourceHandler.processMessageResources(allMessages);
+            const resourceMap = await this.resourceHandler.processMessageResources(allMessages, {
+                checkpoint: () => this.waitForExecutionCheckpoint(task.id),
+                isStopped: () => this.executionControls.get(task.id)?.state === 'stopping'
+            });
+            await this.waitForExecutionCheckpoint(task.id);
 
             this.updateExecutionProgress(task.id, {
                 progress: 65,
@@ -756,9 +884,11 @@ export class ScheduledExportManager {
                 : outputDir;
             if (!fs.existsSync(exportDir)) {
                 fs.mkdirSync(exportDir, { recursive: true });
+                if (shouldPackageAsZip) stopCleanupDirectories.push(exportDir);
             }
 
             let finalFilePath = path.join(exportDir, fileName);
+            if (!fs.existsSync(finalFilePath)) stopCleanupFiles.push(finalFilePath);
             let zipPackagingFailed = false;
             let zipPackagingError: string | undefined;
 
@@ -776,6 +906,7 @@ export class ScheduledExportManager {
                 preferGroupMemberName: task.options.preferGroupMemberName
             });
 
+            await this.waitForExecutionCheckpoint(task.id);
             switch (task.format.toUpperCase()) {
                 case 'HTML':
                     // 🚀 使用流式导出HTML，优化内存占用
@@ -792,8 +923,10 @@ export class ScheduledExportManager {
                             ? { maxEmbedFileSizeBytes: task.options.maxEmbedFileSizeBytes }
                             : {})
                     });
-                    const htmlMessageStream = parser.parseMessagesStream(allMessages, resourceMap);
+                    const parsedHtmlMessageStream = parser.parseMessagesStream(allMessages, resourceMap);
+                    const htmlMessageStream = this.withExecutionCheckpoints(task.id, parsedHtmlMessageStream);
                     const copiedResourcePaths = await htmlExporter.exportFromIterable(htmlMessageStream, chatInfo);
+                    await this.waitForExecutionCheckpoint(task.id);
 
                     if (shouldPackageAsZip) {
                         this.updateExecutionProgress(task.id, {
@@ -803,8 +936,10 @@ export class ScheduledExportManager {
                         });
                         const zipFileName = fileName.replace(/\.html$/i, '.zip');
                         const zipFilePath = path.join(outputDir, zipFileName);
+                        if (!fs.existsSync(zipFilePath)) stopCleanupFiles.push(zipFilePath);
                         try {
                             await ZipExporter.createZip(finalFilePath, zipFilePath, copiedResourcePaths);
+                            await this.waitForExecutionCheckpoint(task.id);
                             finalFilePath = zipFilePath;
                             fs.rmSync(exportDir, { recursive: true, force: true });
                             try {
@@ -844,6 +979,7 @@ export class ScheduledExportManager {
                         resourceMap
                     }, {}, this.core);
                     await jsonExporter.export(allMessages as any, chatInfo);
+                    await this.waitForExecutionCheckpoint(task.id);
                     break;
                 case 'TXT':
                     // TextExporter 会自己处理消息解析，直接传原始消息
@@ -858,6 +994,7 @@ export class ScheduledExportManager {
                         encoding: 'utf-8'
                     }, this.core);
                     await textExporter.export(allMessages as any, chatInfo);
+                    await this.waitForExecutionCheckpoint(task.id);
                     break;
             }
 
@@ -882,19 +1019,50 @@ export class ScheduledExportManager {
 
 
         } catch (error) {
-            history.status = 'failed';
-            history.error = error instanceof Error ? error.message : String(error);
+            const wasStopped = error instanceof ScheduledExportStoppedError
+                || this.executionControls.get(task.id)?.state === 'stopping';
+            history.status = wasStopped ? 'stopped' : 'failed';
+            history.error = wasStopped
+                ? '本轮执行已由用户停止，后续定时计划不受影响'
+                : (error instanceof Error ? error.message : String(error));
+            if (wasStopped) {
+                // 停止发生在写文件期间时，清掉只属于本轮的新建半成品；共享 resources
+                // 缓存不动，避免误删其它导出仍在引用的媒体。
+                for (const filePath of stopCleanupFiles) {
+                    try {
+                        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+                    } catch {
+                        // 清理失败不会把“已停止”改成“失败”。
+                    }
+                }
+                for (const directoryPath of stopCleanupDirectories) {
+                    try {
+                        if (fs.existsSync(directoryPath)) fs.rmSync(directoryPath, { recursive: true, force: true });
+                    } catch {
+                        // ignore
+                    }
+                }
+            }
         } finally {
+            try {
+                this.resourceHandler.setSkipDownloadTypes([]);
+            } catch {
+                // ignore
+            }
             history.duration = Date.now() - startTime;
 
             const finalMessage = history.status === 'success'
                 ? (history.messageCount === 0 ? '执行完成：没有符合条件的消息' : '导出完成')
                 : history.status === 'partial'
                     ? (history.error || '导出完成，但部分资源处理失败')
+                    : history.status === 'stopped'
+                        ? (history.error || '本轮执行已停止')
                     : (history.error || '导出失败');
             this.updateExecutionProgress(task.id, {
                 status: history.status,
-                progress: 100,
+                progress: history.status === 'stopped'
+                    ? this.executionProgress.get(task.id)?.progress
+                    : 100,
                 stage: 'complete',
                 message: finalMessage,
                 historyId

@@ -38,7 +38,7 @@ export interface ScheduledExportConfig {
 
 export interface ScheduledExportProgress {
     taskId: string;
-    status: 'idle' | 'queued' | 'running' | 'success' | 'partial' | 'failed';
+    status: 'idle' | 'queued' | 'running' | 'paused' | 'stopping' | 'stopped' | 'success' | 'partial' | 'failed';
     progress: number;
     stage: 'idle' | 'fetching' | 'resources' | 'exporting' | 'packaging' | 'complete';
     message: string;
@@ -81,7 +81,7 @@ export interface ExecutionHistory {
     id: string;
     scheduledExportId: string;
     executedAt: string;
-    status: 'success' | 'failed' | 'partial';
+    status: 'success' | 'failed' | 'partial' | 'stopped';
     messageCount?: number;
     filePath?: string;
     fileSize?: number;
@@ -229,6 +229,41 @@ export function useScheduledExports() {
         }
     }, [apiCall, fetchTasks]);
 
+    const startProgressPolling = useCallback((id: string) => {
+        if (progressPolls.current.has(id)) return;
+        progressPolls.current.add(id);
+        void (async () => {
+            try {
+                while (true) {
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    const progressResponse = await apiCall(`/api/scheduled-exports/${id}/progress`) as APIResponse<ScheduledExportProgress>;
+                    if (!progressResponse.success || !progressResponse.data) break;
+                    const next = progressResponse.data;
+                    setExecutionProgress(current => ({ ...current, [id]: next }));
+                    if (['success', 'partial', 'failed', 'stopped'].includes(next.status)) {
+                        toast({
+                            title: next.status === 'failed'
+                                ? "执行失败"
+                                : next.status === 'partial'
+                                    ? "部分完成"
+                                    : next.status === 'stopped'
+                                        ? "执行已停止"
+                                        : "执行完成",
+                            description: next.message,
+                            ...(next.status === 'failed' ? { variant: "destructive" as const } : {})
+                        });
+                        await fetchTasks();
+                        break;
+                    }
+                }
+            } catch (pollError) {
+                console.error('获取任务执行进度失败:', pollError);
+            } finally {
+                progressPolls.current.delete(id);
+            }
+        })();
+    }, [apiCall, fetchTasks]);
+
     // 手动触发定时导出任务
     const triggerTask = useCallback(async (id: string) => {
         try {
@@ -246,33 +281,7 @@ export function useScheduledExports() {
                     description: started ? "可在任务列表中查看实时进度" : "已阻止重复启动，将继续显示现有任务进度"
                 });
 
-                if (!progressPolls.current.has(id)) {
-                    progressPolls.current.add(id);
-                    void (async () => {
-                        try {
-                            while (true) {
-                                await new Promise(resolve => setTimeout(resolve, 1000));
-                                const progressResponse = await apiCall(`/api/scheduled-exports/${id}/progress`) as APIResponse<ScheduledExportProgress>;
-                                if (!progressResponse.success || !progressResponse.data) break;
-                                const next = progressResponse.data;
-                                setExecutionProgress(current => ({ ...current, [id]: next }));
-                                if (['success', 'partial', 'failed'].includes(next.status)) {
-                                    toast({
-                                        title: next.status === 'failed' ? "执行失败" : next.status === 'partial' ? "部分完成" : "执行完成",
-                                        description: next.message,
-                                        ...(next.status === 'failed' ? { variant: "destructive" as const } : {})
-                                    });
-                                    await fetchTasks();
-                                    break;
-                                }
-                            }
-                        } catch (pollError) {
-                            console.error('获取任务执行进度失败:', pollError);
-                        } finally {
-                            progressPolls.current.delete(id);
-                        }
-                    })();
-                }
+                startProgressPolling(id);
                 return response.data;
             } else {
                 throw new Error(response.error?.message || '触发任务失败');
@@ -288,7 +297,36 @@ export function useScheduledExports() {
         } finally {
             setLoading(false);
         }
-    }, [apiCall, fetchTasks]);
+    }, [apiCall, startProgressPolling]);
+
+    const controlTaskExecution = useCallback(async (
+        id: string,
+        action: 'pause' | 'resume' | 'stop'
+    ) => {
+        try {
+            const response = await apiCall(`/api/scheduled-exports/${id}/${action}`, {
+                method: 'POST',
+            }) as APIResponse<{ changed: boolean; progress: ScheduledExportProgress }>;
+            if (!response.success || !response.data) {
+                throw new Error(response.error?.message || '操作任务失败');
+            }
+
+            const { changed, progress } = response.data;
+            setExecutionProgress(current => ({ ...current, [id]: progress }));
+            startProgressPolling(id);
+            toast({
+                title: changed
+                    ? action === 'pause' ? '任务已暂停' : action === 'resume' ? '任务已继续' : '正在停止任务'
+                    : '任务状态未改变',
+                description: progress.message
+            });
+            return response.data;
+        } catch (err) {
+            const errorMsg = err instanceof Error ? err.message : '操作任务失败';
+            toast({ title: '错误', description: errorMsg, variant: 'destructive' });
+            throw err;
+        }
+    }, [apiCall, startProgressPolling]);
 
     // 获取任务执行历史
     const fetchTaskHistory = useCallback(async (id: string, limit: number = 50): Promise<ExecutionHistory[]> => {
@@ -334,6 +372,25 @@ export function useScheduledExports() {
         fetchTasks();
     }, [fetchTasks]);
 
+    // 页面重载后也能发现由 cron 启动的执行实例，并恢复进度轮询与控制按钮。
+    useEffect(() => {
+        for (const task of tasks) {
+            void (async () => {
+                try {
+                    const response = await apiCall(`/api/scheduled-exports/${task.id}/progress`) as APIResponse<ScheduledExportProgress>;
+                    if (!response.success || !response.data) return;
+                    const progress = response.data;
+                    setExecutionProgress(current => ({ ...current, [task.id]: progress }));
+                    if (['queued', 'running', 'paused', 'stopping'].includes(progress.status)) {
+                        startProgressPolling(task.id);
+                    }
+                } catch {
+                    // 单个任务的内存进度不可用不影响任务列表。
+                }
+            })();
+        }
+    }, [apiCall, startProgressPolling, tasks]);
+
     return {
         scheduledExports: tasks,
         executionProgress,
@@ -345,6 +402,9 @@ export function useScheduledExports() {
         updateScheduledExportFromForm: updateTaskFromForm,
         deleteScheduledExport: deleteTask,
         triggerScheduledExport: triggerTask,
+        pauseScheduledExport: (id: string) => controlTaskExecution(id, 'pause'),
+        resumeScheduledExport: (id: string) => controlTaskExecution(id, 'resume'),
+        stopScheduledExport: (id: string) => controlTaskExecution(id, 'stop'),
         toggleScheduledExport: async (id: string, enabled: boolean) => {
             const task = tasks.find(t => t.id === id);
             if (task) {

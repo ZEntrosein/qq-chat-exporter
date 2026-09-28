@@ -401,7 +401,7 @@ export interface ScheduledExportHistory {
   id: string
   scheduledExportId: string
   executedAt: string
-  status: 'success' | 'failed' | 'partial'
+  status: 'success' | 'failed' | 'partial' | 'stopped'
   messageCount?: number
   filePath?: string
   fileSize?: number

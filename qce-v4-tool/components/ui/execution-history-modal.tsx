@@ -143,6 +143,7 @@ export function ExecutionHistoryModal({
                         <div className={`w-2 h-2 rounded-full flex-shrink-0 ${
                           item.status === 'success' ? 'bg-muted-foreground/60' :
                           item.status === 'failed' ? 'bg-foreground' :
+                          item.status === 'stopped' ? 'bg-amber-500' :
                           'bg-muted-foreground/40'
                         }`} />
                         
@@ -172,9 +173,10 @@ export function ExecutionHistoryModal({
                         <span className={`text-xs px-2 py-0.5 rounded ${
                           item.status === 'success' ? 'bg-muted text-muted-foreground' :
                           item.status === 'failed' ? 'bg-muted text-foreground/80' :
+                          item.status === 'stopped' ? 'bg-amber-50 text-amber-700 dark:bg-amber-950/30 dark:text-amber-300' :
                           'bg-muted text-muted-foreground'
                         }`}>
-                          {item.status === 'success' ? '成功' : item.status === 'failed' ? '失败' : '部分'}
+                          {item.status === 'success' ? '成功' : item.status === 'failed' ? '失败' : item.status === 'stopped' ? '已停止' : '部分'}
                         </span>
 
                         <ChevronRight className={`w-4 h-4 text-muted-foreground/40 transition-transform ${

@@ -65,6 +65,8 @@ import {
   ChevronRight,
   Search,
   Square,
+  Pause,
+  Play,
 } from "lucide-react"
 import type { CreateTaskForm, CreateScheduledExportForm } from "@/types/api"
 import { useQCE } from "@/hooks/use-qce"
@@ -441,6 +443,9 @@ export default function QCEDashboard() {
     updateScheduledExportFromForm,
     deleteScheduledExport,
     triggerScheduledExport,
+    pauseScheduledExport,
+    resumeScheduledExport,
+    stopScheduledExport,
     toggleScheduledExport,
     getExecutionHistory,
     getStats: getScheduledStats,
@@ -1956,7 +1961,10 @@ export default function QCEDashboard() {
                       .filter(se => scheduledFilter === 'all' || (scheduledFilter === 'enabled' ? se.enabled : !se.enabled))
                       .map((scheduledExport) => {
                         const progress = executionProgress[scheduledExport.id]
+                        const isPaused = progress?.status === 'paused'
+                        const isStopping = progress?.status === 'stopping'
                         const isRunning = progress?.status === 'queued' || progress?.status === 'running'
+                        const isActive = isRunning || isPaused || isStopping
                         return (
                       <div
                         key={scheduledExport.id}
@@ -2006,15 +2014,15 @@ export default function QCEDashboard() {
                                 </>
                               )}
                             </div>
-                            {isRunning && progress && (
+                            {isActive && progress && (
                               <div className="mt-2 max-w-md">
-                                <div className="flex items-center justify-between text-[10px] text-blue-600 dark:text-blue-400 mb-1">
+                                <div className={`flex items-center justify-between text-[10px] mb-1 ${isPaused ? 'text-amber-600 dark:text-amber-400' : isStopping ? 'text-red-600 dark:text-red-400' : 'text-blue-600 dark:text-blue-400'}`}>
                                   <span className="truncate pr-3">{progress.message}</span>
                                   <span>{progress.progress}%</span>
                                 </div>
                                 <div className="h-1 rounded-full bg-blue-100 dark:bg-blue-950/50 overflow-hidden">
                                   <div
-                                    className="h-full bg-blue-500 transition-all duration-300"
+                                    className={`h-full transition-all duration-300 ${isPaused ? 'bg-amber-500' : isStopping ? 'bg-red-500' : 'bg-blue-500'}`}
                                     style={{ width: `${progress.progress}%` }}
                                   />
                                 </div>
@@ -2023,7 +2031,7 @@ export default function QCEDashboard() {
                           </div>
                         </div>
 
-                        <div className={`flex items-center gap-0.5 flex-shrink-0 transition-opacity ${isRunning ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
+                        <div className={`flex items-center gap-0.5 flex-shrink-0 transition-opacity ${isActive ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}`}>
                           <button
                             className="px-2 py-1 text-[11px] text-muted-foreground/50 hover:text-foreground rounded-md hover:bg-black/[0.04] dark:hover:bg-white/[0.04] transition-colors"
                             onClick={() => toggleScheduledExport(scheduledExport.id, !scheduledExport.enabled)}
@@ -2033,10 +2041,40 @@ export default function QCEDashboard() {
                           <button
                             className="px-2 py-1 text-[11px] text-muted-foreground/50 hover:text-foreground rounded-md hover:bg-black/[0.04] dark:hover:bg-white/[0.04] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                             onClick={() => triggerScheduledExport(scheduledExport.id)}
-                            disabled={isRunning}
+                            disabled={isActive}
                           >
-                            {isRunning ? `${progress?.progress ?? 0}%` : "执行"}
+                            {isActive ? `${progress?.progress ?? 0}%` : "执行"}
                           </button>
+                          {isRunning && (
+                            <button
+                              className="inline-flex items-center gap-1 px-2 py-1 text-[11px] text-amber-600 hover:text-amber-700 rounded-md hover:bg-amber-50 dark:hover:bg-amber-950/30 transition-colors"
+                              onClick={() => pauseScheduledExport(scheduledExport.id)}
+                              title="暂停本轮执行"
+                            >
+                              <Pause className="w-3 h-3" />暂停
+                            </button>
+                          )}
+                          {isPaused && (
+                            <button
+                              className="inline-flex items-center gap-1 px-2 py-1 text-[11px] text-blue-600 hover:text-blue-700 rounded-md hover:bg-blue-50 dark:hover:bg-blue-950/30 transition-colors"
+                              onClick={() => resumeScheduledExport(scheduledExport.id)}
+                              title="继续本轮执行"
+                            >
+                              <Play className="w-3 h-3" />继续
+                            </button>
+                          )}
+                          {(isRunning || isPaused) && (
+                            <button
+                              className="inline-flex items-center gap-1 px-2 py-1 text-[11px] text-red-600 hover:text-red-700 rounded-md hover:bg-red-50 dark:hover:bg-red-950/30 transition-colors"
+                              onClick={() => stopScheduledExport(scheduledExport.id)}
+                              title="停止本轮执行，不影响以后周期"
+                            >
+                              <Square className="w-3 h-3" />停止
+                            </button>
+                          )}
+                          {isStopping && (
+                            <span className="px-2 py-1 text-[11px] text-red-500">正在停止…</span>
+                          )}
                           <button
                             className="px-2 py-1 text-[11px] text-muted-foreground/50 hover:text-foreground rounded-md hover:bg-black/[0.04] dark:hover:bg-white/[0.04] transition-colors"
                             onClick={() => handleEditScheduledExport(scheduledExport)}

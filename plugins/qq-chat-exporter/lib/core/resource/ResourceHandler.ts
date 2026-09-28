@@ -66,6 +66,13 @@ interface DownloadTask {
     priority: number;
     retries: number;
     createdAt: Date;
+    control?: ResourceProcessingControl;
+}
+
+/** 可选的协作式控制器，供定时导出在资源阶段暂停或停止。 */
+export interface ResourceProcessingControl {
+    checkpoint: () => Promise<void>;
+    isStopped: () => boolean;
 }
 
 /**
@@ -437,7 +444,10 @@ export class ResourceHandler {
     /**
      * 批量处理消息中的资源
      */
-    async processMessageResources(messages: RawMessage[]): Promise<Map<string, ResourceInfo[]>> {
+    async processMessageResources(
+        messages: RawMessage[],
+        control?: ResourceProcessingControl
+    ): Promise<Map<string, ResourceInfo[]>> {
         const resourceMap = new Map<string, ResourceInfo[]>();
         let resourcesNeedingDownload = 0;
         const allResources: ResourceInfo[] = [];
@@ -466,6 +476,7 @@ export class ResourceHandler {
         const seenMessageIds = new Set<string>();
         const pending = [...messages];
         for (let cursor = 0; cursor < pending.length; cursor++) {
+            await control?.checkpoint();
             const message = pending[cursor];
             if (!message) continue;
             const key = String((message as any).__qceResourceKey || message.msgId || '');
@@ -479,9 +490,10 @@ export class ResourceHandler {
             const resources: ResourceInfo[] = [];
 
             for (const element of message.elements || []) {
+                await control?.checkpoint();
                 if (this.isMediaElement(element)) {
                     try {
-                        const resourceInfo = await this.processElement(message, element);
+                        const resourceInfo = await this.processElement(message, element, control);
                         if (resourceInfo) {
                             resources.push(resourceInfo);
                             allResources.push(resourceInfo);
@@ -518,7 +530,7 @@ export class ResourceHandler {
             // 给下载队列处理器足够时间启动和处理
             await new Promise(resolve => setTimeout(resolve, 1000));
 
-            await this.waitForAllDownloads();
+            await this.waitForAllDownloads(control);
         }
 
         // 计算本批次摘要（issue #363）。规则：
@@ -583,7 +595,11 @@ export class ResourceHandler {
     /**
      * 处理单个媒体元素
      */
-    private async processElement(message: RawMessage, element: MessageElement): Promise<ResourceInfo | null> {
+    private async processElement(
+        message: RawMessage,
+        element: MessageElement,
+        control?: ResourceProcessingControl
+    ): Promise<ResourceInfo | null> {
         const baseResourceInfo = this.extractResourceInfo(element);
         if (!baseResourceInfo) {
             return null;
@@ -618,7 +634,7 @@ export class ResourceHandler {
                 resourceInfo.localPath = '';
             } else {
                 resourceInfo.status = ResourceStatus.PENDING;
-                await this.enqueueDownload(message, element, resourceInfo);
+                await this.enqueueDownload(message, element, resourceInfo, control);
                 // 注意：enqueueDownload只是添加到队列，实际下载是异步的
                 // 我们在processMessageResources的最后统一等待所有下载完成
             }
@@ -835,7 +851,12 @@ export class ResourceHandler {
     /**
      * 添加到下载队列
      */
-    private async enqueueDownload(message: RawMessage, element: MessageElement, resourceInfo: ResourceInfo): Promise<void> {
+    private async enqueueDownload(
+        message: RawMessage,
+        element: MessageElement,
+        resourceInfo: ResourceInfo,
+        control?: ResourceProcessingControl
+    ): Promise<void> {
         const taskId = `${message.msgId}_${element.elementId}`;
         
         // 检查是否已在队列中
@@ -850,7 +871,8 @@ export class ResourceHandler {
             element,
             priority: this.calculatePriority(resourceInfo),
             retries: 0,
-            createdAt: new Date()
+            createdAt: new Date(),
+            control
         };
 
         this.downloadQueue.push(task);
@@ -894,9 +916,32 @@ export class ResourceHandler {
         
         try {
             while (this.downloadQueue.length > 0) {
+                const nextTask = this.downloadQueue[0];
+                if (nextTask?.control) {
+                    if (nextTask.control.isStopped()) {
+                        this.discardStoppedDownloads(nextTask.control);
+                        continue;
+                    }
+                    try {
+                        await nextTask.control.checkpoint();
+                    } catch {
+                        this.discardStoppedDownloads(nextTask.control);
+                        continue;
+                    }
+                }
+
                 // 控制并发数量
                 while (this.activeDownloads.size >= this.config.maxConcurrentDownloads) {
                     await this.waitForDownloadSlot();
+                }
+
+                if (nextTask?.control) {
+                    try {
+                        await nextTask.control.checkpoint();
+                    } catch {
+                        this.discardStoppedDownloads(nextTask.control);
+                        continue;
+                    }
                 }
                 
                 const task = this.downloadQueue.shift();
@@ -941,6 +986,23 @@ export class ResourceHandler {
         }
     }
 
+    /** 丢弃属于同一已停止执行实例、且尚未开始的下载。已开始的请求允许自行收尾。 */
+    private discardStoppedDownloads(control: ResourceProcessingControl): void {
+        const retained: DownloadTask[] = [];
+        for (const task of this.downloadQueue) {
+            if (task.control === control) {
+                task.resourceInfo.status = ResourceStatus.FAILED;
+                task.resourceInfo.accessible = false;
+                task.resourceInfo.lastError = '定时导出已停止';
+                this.failedResourcesForProgress++;
+            } else {
+                retained.push(task);
+            }
+        }
+        this.downloadQueue = retained;
+        this.emitProgress();
+    }
+
     /**
      * 等待下载槽位
      */
@@ -960,7 +1022,7 @@ export class ResourceHandler {
     /**
      * 等待所有下载任务完成
      */
-    private async waitForAllDownloads(): Promise<void> {
+    private async waitForAllDownloads(control?: ResourceProcessingControl): Promise<void> {
         // 如果没有任何下载任务，直接返回
         if (this.downloadQueue.length === 0 && this.activeDownloads.size === 0 && !this.isProcessing) {
             return;
@@ -972,6 +1034,7 @@ export class ResourceHandler {
         const stagnationThreshold = 20; // N 次检测无进展则尝试重启（约 10 秒，因后面 sleep 500ms）
 
         while (true) {
+            await control?.checkpoint();
             const queueEmpty = this.downloadQueue.length === 0;
             const noActiveDownloads = this.activeDownloads.size === 0;
             const notProcessing = !this.isProcessing;
