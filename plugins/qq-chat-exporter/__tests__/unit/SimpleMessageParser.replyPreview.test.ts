@@ -593,7 +593,7 @@ test('forward sender avatar: 使用原始 MultiMsg 节点自带的签名头像 U
                                                 responseHead: {
                                                     fromUin: 1094950020,
                                                     fromUid: 'u_anonymous_forward_owner',
-                                                    grp: { memberName: '成员甲' },
+                                                    grp: { groupUin: 987654321, memberName: '成员甲' },
                                                 },
                                             },
                                             {
@@ -605,7 +605,7 @@ test('forward sender avatar: 使用原始 MultiMsg 节点自带的签名头像 U
                                                 responseHead: {
                                                     fromUin: 1094950020,
                                                     fromUid: 'u_anonymous_forward_owner',
-                                                    grp: { memberName: '成员乙' },
+                                                    grp: { groupUin: 987654321, memberName: '成员乙' },
                                                 },
                                             },
                                         ],
@@ -640,6 +640,7 @@ test('forward sender avatar: 使用原始 MultiMsg 节点自带的签名头像 U
             name: record.sendNickName,
             avatarUrl: record.avatarUrl,
             protocolAvatar: record.__qceForwardProtocolAvatar,
+            sourcePeer: record.__qceForwardPeer,
         })), [
             {
                 uid: '',
@@ -647,6 +648,7 @@ test('forward sender avatar: 使用原始 MultiMsg 节点自带的签名头像 U
                 name: '成员甲',
                 avatarUrl: 'http://qh.qlogo.cn/g?b=oidb&ek=avatar-a&s=0',
                 protocolAvatar: true,
+                sourcePeer: { chatType: 2, peerUid: '987654321', guildId: '' },
             },
             {
                 uid: '',
@@ -654,6 +656,7 @@ test('forward sender avatar: 使用原始 MultiMsg 节点自带的签名头像 U
                 name: '成员乙',
                 avatarUrl: 'http://qh.qlogo.cn/g?b=oidb&ek=avatar-b&s=0',
                 protocolAvatar: true,
+                sourcePeer: { chatType: 2, peerUid: '987654321', guildId: '' },
             },
         ]);
 

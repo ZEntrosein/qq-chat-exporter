@@ -260,6 +260,11 @@ interface ForwardPacketIdentity {
   uin: string;
   name: string;
   avatarUrl: string;
+  sourcePeer?: {
+    chatType: number;
+    peerUid: string;
+    guildId: string;
+  };
 }
 
 export interface ResourceData {
@@ -820,6 +825,11 @@ export class SimpleMessageParser {
       const response = packet?.responseHead || {};
       const content = packet?.contentHead || {};
       const uin = String(response?.fromUin ?? '').trim();
+      const groupUin = String(
+        response?.grp?.groupUin
+        ?? response?.grp?.groupCode
+        ?? ''
+      ).trim();
       const avatarCandidate = String(
         content?.forward?.unknownBase64
         ?? content?.forward?.avatarUrl
@@ -839,10 +849,15 @@ export class SimpleMessageParser {
           ?? response?.friendName
           ?? ''
         ).trim(),
-        avatarUrl: /^https?:\/\//i.test(avatarCandidate) ? avatarCandidate : ''
+        avatarUrl: /^https?:\/\//i.test(avatarCandidate) ? avatarCandidate : '',
+        // 原始 MultiMsg 协议里的 groupUin 才是这条子消息真正所属的群。
+        // 外层卡片可能位于私聊，不能用外层 peer 去请求子消息的视频/语音。
+        sourcePeer: /^\d+$/.test(groupUin) && groupUin !== '0'
+          ? { chatType: 2, peerUid: groupUin, guildId: '' }
+          : undefined
       };
     }).filter((identity: ForwardPacketIdentity) =>
-      identity.uid || identity.uin || identity.name || identity.avatarUrl
+      identity.uid || identity.uin || identity.name || identity.avatarUrl || identity.sourcePeer
     );
     if (!identities.length) return;
 
@@ -884,6 +899,9 @@ export class SimpleMessageParser {
         (record as any).sendNickName = best.name;
         (record as any).sendMemberName = best.name;
       }
+      if (best.sourcePeer) {
+        (record as any).__qceForwardPeer = best.sourcePeer;
+      }
     });
   }
 
@@ -917,7 +935,27 @@ export class SimpleMessageParser {
     for (const record of records) {
       if (!record || typeof record !== 'object') continue;
       (record as any).__qceForwardRootMsgId = context.rootMsgId;
-      (record as any).__qceForwardPeer = context.peer;
+      const attachedPeer = (record as any).__qceForwardPeer;
+      const attachedPeerUid = String(attachedPeer?.peerUid ?? '').trim();
+      const attachedChatType = Number(attachedPeer?.chatType ?? 0);
+      if (attachedPeerUid && attachedPeerUid !== '0' && attachedChatType > 0) {
+        // restoreForwardSenderIdentities 已从协议包恢复了真正来源群时必须保留。
+        // 尤其是“私聊中的合并转发里又引用群视频”的场景，覆盖成外层私聊
+        // 会让 getVideoUrlPacket 带错 peer，最终只剩文件名占位文本。
+        continue;
+      }
+
+      const recordPeerUid = String((record as any).peerUid ?? '').trim();
+      const recordChatType = Number((record as any).chatType ?? 0);
+      (record as any).__qceForwardPeer = recordPeerUid
+        && recordPeerUid !== '0'
+        && recordChatType > 0
+        ? {
+            chatType: recordChatType,
+            peerUid: recordPeerUid,
+            guildId: String((record as any).guildId ?? '')
+          }
+        : context.peer;
     }
     return records;
   }
